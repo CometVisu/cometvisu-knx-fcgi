@@ -19,10 +19,13 @@
  *        CometVisu protocol.
  *
  * This is deliberately minimal — the CometVisu protocol only uses flat
- * JSON objects with string and integer values.  No external JSON library
- * dependency is needed.  The builder escapes only the four JSON-special
- * characters (", \, \n, \r, \t) because all values come from hex_encode()
- * (always [0-9a-f]) or fixed protocol strings.
+ * JSON objects with string, number and boolean values, so a library with
+ * its own DOM and serializer would be pure overhead on an embedded system.
+ *
+ * Every string is escaped: quotes, backslashes, the C escapes and all
+ * remaining control characters (`\u00XX`).  Values are hex strings or fixed
+ * protocol keys today, but the response must stay parsable whatever a caller
+ * passes in.
  */
 
 #pragma once
@@ -30,13 +33,15 @@
 #include <string>
 #include <string_view>
 
-namespace cvknxd {
+namespace cvknx {
 
 /**
  * @brief Minimal JSON builder.
  *
- * Builds JSON strings incrementally with automatic comma insertion.
- * Callers must ensure start_object() / end_object() are balanced.
+ * Builds JSON strings incrementally with automatic comma insertion (each
+ * `add_*` call writes the separator itself, so callers never track whether
+ * they are first).  Balance is not validated: every caller emits a fixed,
+ * known shape.
  *
  * Example:
  * @code
@@ -52,10 +57,10 @@ class JsonBuilder {
 public:
   JsonBuilder() = default;
 
-  /// Start a JSON object: "{"
+  /// Open a nested object and reset the comma state for its first member.
   void start_object();
 
-  /// End a JSON object: "}"
+  /// Close the current object; the enclosing object continues with a member.
   void end_object();
 
   /// Add a string key-value pair: "key":"value"
@@ -74,26 +79,26 @@ public:
   /// Append raw JSON (for already-built sub-objects).
   void add_raw(std::string_view raw);
 
-  /// Get the built JSON string.
+  /// Get the built JSON string without consuming it (for tests and logging).
   [[nodiscard]] const std::string& str() const { return buffer_; }
 
-  /// Move the built JSON string out.
+  /// Move the built JSON string out; the builder is empty afterwards.
   [[nodiscard]] std::string take() { return std::move(buffer_); }
 
-  /// Clear for reuse.
+  /// Reset to an empty object state so the instance can be reused.
   void clear() {
     buffer_.clear();
     first_ = true;
-    open_objects_ = 0;
   }
 
 private:
   std::string buffer_;
+  /// True until the first member of the current object has been written; the
+  /// next `add_*` call must not emit a comma.
   bool first_ = true;
-  int open_objects_ = 0;
 
   void add_comma();
   void add_quoted(std::string_view str);
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

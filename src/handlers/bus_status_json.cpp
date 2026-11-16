@@ -14,23 +14,23 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /**
- * @file knxd_status_json.cpp
+ * @file bus_status_json.cpp
  * @brief Implementation of the knxd outage block used by /r and /w.
  */
 
-#include "knxd_status_json.h"
+#include "bus_status_json.h"
 
 #include "util/json_builder.h"
 
-namespace cvknxd {
+namespace cvknx {
 
-bool add_knxd_outage(JsonBuilder& json, const SharedGroupCache::KnxdStatus& status,
-                     bool force_unavailable) {
+bool add_bus_outage(JsonBuilder& json, const SharedGroupCache::BusStatus& status,
+                    std::string_view key, bool force_unavailable) {
   if (status.available && !force_unavailable) {
-    return false;  // no field at all while knxd is reachable
+    return false;  // no field at all while the bus is reachable
   }
 
-  json.add_key("knxd");
+  json.add_key(key);
   json.start_object();
   json.add_bool("ok", false);
   if (status.down_since != 0) {
@@ -43,4 +43,4 @@ bool add_knxd_outage(JsonBuilder& json, const SharedGroupCache::KnxdStatus& stat
   return true;
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

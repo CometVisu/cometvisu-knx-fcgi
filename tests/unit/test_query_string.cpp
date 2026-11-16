@@ -17,7 +17,7 @@
 
 #include "util/query_string.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 TEST(QueryStringTest, EmptyInput) {
   QueryString qs("");
@@ -196,4 +196,68 @@ TEST(QueryStringTest, TotalParamCountLimitIsEnforcedAndReported) {
   ASSERT_EQ(b.size(), limit / 2);
 
   EXPECT_TRUE(qs.limit_exceeded());
+}
+
+TEST(QueryStringTest, DecodesLowercaseHexAndPlus) {
+  const QueryString params{"a=%6a&b=1+2"};
+  ASSERT_TRUE(params.get("a").has_value());
+  EXPECT_EQ(*params.get("a"), "j");
+  ASSERT_TRUE(params.get("b").has_value());
+  EXPECT_EQ(*params.get("b"), "1 2");
+}
+
+TEST(QueryStringTest, LeavesInvalidEscapesLiteral) {
+  const QueryString params{"a=%zz"};
+  ASSERT_TRUE(params.get("a").has_value());
+  EXPECT_EQ(*params.get("a"), "%zz");
+}
+
+TEST(QueryStringTest, SkipsTrailingPairWithoutValue) {
+  const QueryString params{"a=1&broken"};
+  ASSERT_TRUE(params.get("a").has_value());
+  EXPECT_EQ(*params.get("a"), "1");
+  EXPECT_FALSE(params.get("broken").has_value());
+}
+
+TEST(QueryStringTest, DecodesEveryHexDigitClass) {
+  // Digits, lowercase, uppercase and a non-hex symbol in one string.
+  const QueryString params{"d=%41&e=%61&f=%4a&g=%7a&h=%21"};
+  EXPECT_EQ(*params.get("d"), "A");
+  EXPECT_EQ(*params.get("e"), "a");
+  EXPECT_EQ(*params.get("f"), "J");
+  EXPECT_EQ(*params.get("g"), "z");
+  EXPECT_EQ(*params.get("h"), "!");
+}
+
+TEST(QueryStringTest, TreatsPartiallyInvalidEscapesAsLiteral) {
+  // Only one half of the pair is a hex digit — the escape is kept verbatim.
+  const QueryString params{"a=%6z&b=%z6&c=%zz"};
+  EXPECT_EQ(*params.get("a"), "%6z");
+  EXPECT_EQ(*params.get("b"), "%z6");
+  EXPECT_EQ(*params.get("c"), "%zz");
+}
+
+TEST(QueryStringTest, KeepsTruncatedPercentEscapeLiteral) {
+  const QueryString params{"a=%&b=%4"};
+  EXPECT_EQ(*params.get("a"), "%");
+  EXPECT_EQ(*params.get("b"), "%4");
+}
+
+TEST(QueryStringTest, SkipsPairsThatLackAValueSeparator) {
+  // '&' before '=' (empty key), and a trailing key without '='.
+  const QueryString params{"&a=1&b=2"};
+  EXPECT_EQ(*params.get("a"), "1");
+  EXPECT_EQ(*params.get("b"), "2");
+
+  const QueryString tail{"x&y=2"};
+  EXPECT_FALSE(tail.get("x").has_value());
+  EXPECT_EQ(*tail.get("y"), "2");
+}
+
+TEST(QueryStringTest, TreatsEscapesBelowTheDigitRangeAsLiteral) {
+  // '!' (0x21) and '@' (0x40) are below '0' and below 'A' respectively, so both
+  // nibble comparisons must reject them.
+  const QueryString params{"a=%!1&b=%:1"};
+  EXPECT_EQ(*params.get("a"), "%!1");
+  EXPECT_EQ(*params.get("b"), "%:1");
 }

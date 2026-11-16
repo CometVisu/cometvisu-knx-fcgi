@@ -19,9 +19,9 @@
 #include <thread>
 
 #include "knxd/knxd_client.h"
-#include "mock_knxd_socket.h"
+#include "mock_bus_link.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 class KnxdClientConcurrencyTest : public ::testing::Test {
 protected:
@@ -29,7 +29,7 @@ protected:
     ASSERT_TRUE(client_.connect("/run/knx"));
     ASSERT_TRUE(client_.open_group_socket(false));
   }
-  MockKnxdClient client_;  // NOLINT(misc-non-private-member-variables-in-classes)
+  MockBusLink client_;  // NOLINT(misc-non-private-member-variables-in-classes)
 };
 
 /// send_group_packet and wait_for_activity can run concurrently.

@@ -1,0 +1,78 @@
+{
+  // Development container for cometvisu-knx-fcgi.
+  //
+  // Open the repository in VS Code and run "Dev Containers: Reopen in
+  // Container".  The first build installs the toolchain (see ./Dockerfile);
+  // the post-create step configures and builds the project so the CMake Tools
+  // extension and the test explorer work immediately.
+  "name": "cometvisu-knx-fcgi (C++20)",
+
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // tcpdump on KNXnet/IP traffic (UDP 3671) needs CAP_NET_RAW; CAP_NET_ADMIN
+  // is used when joining the routing multicast group on a specific interface.
+  //
+  // NOTE for real KNXnet/IP testing: UDP multicast (224.0.23.12) and KNXnet/IP
+  // discovery do not traverse Docker's default bridge reliably.  On Linux add
+  //   "runArgs": ["--network=host"]
+  // (and drop this comment) if the container must see the real KNX IP router.
+  "runArgs": ["--cap-add=NET_RAW", "--cap-add=NET_ADMIN"],
+
+  // The workspace is bind-mounted from the host, so without this the container
+  // would share `build/` (and its CMake cache, which stores absolute source and
+  // build paths) with the host build.  A named volume gives the container its
+  // own build tree, keeps the host build intact, and survives rebuilds.
+  // .devcontainer/post-create.sh takes ownership of the volume (Docker creates
+  // it as root).
+  "mounts": [
+    "source=cometvisu-knx-fcgi-build,target=${containerWorkspaceFolder}/build,type=volume",
+    // Reuse the host git identity (user.name / user.email) so commits work
+    // inside the container exactly as on the host.  ${localEnv:USERPROFILE}
+    // covers Windows hosts, where HOME is not set.
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/vscode/.gitconfig,type=bind"
+  ],
+
+  "containerEnv": {
+    // Keep builds parallel but bounded so the container stays responsive.
+    "CMAKE_BUILD_PARALLEL_LEVEL": "4"
+  },
+
+  // Configure + build.  `build/` is a container-private volume, but a stale
+  // cache (e.g. from the host) is still detected and discarded first — see
+  // .devcontainer/post-create.sh.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  // Direct FCGI socket (FCGI_SOCKET=:9000) and the knxd local test setup.
+  "forwardPorts": [9000],
+  "portsAttributes": {
+    "9000": {
+      "label": "FastCGI (TCP)",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      // The repository already version-controls .vscode/settings.json and
+      // .vscode/c_cpp_properties.json — only the extensions are added here so
+      // the container does not override the project conventions (2-space
+      // indents, format-on-save off, Release configure settings, …).
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools-extension-pack",
+        // LLM model provider used by Copilot Chat.  It must be installed in
+        // the container (not only on the host) because the chat/model API runs
+        // in the remote extension host.
+        "vizards.deepseek-v4-for-copilot"
+      ]
+    }
+  },
+
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb"
+  }
+}

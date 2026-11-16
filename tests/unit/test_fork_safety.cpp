@@ -118,7 +118,7 @@ TEST(ForkSafetyTest, FlushBeforeForkWritesPendingLinesImmediately) {
   ASSERT_TRUE(capture.active()) << "cannot redirect stdout";
 
   std::cout << "pending-line\n";  // intentionally left in the buffer
-  cvknxd::flush_before_fork();
+  cvknx::flush_before_fork();
 
   EXPECT_TRUE(wait_for_data(capture.read_fd(), 1000))
       << "flush_before_fork() left data in the stdio buffer";
@@ -133,7 +133,7 @@ TEST(ForkSafetyTest, ForkedChildDoesNotRepeatTheParentsBufferedLines) {
 
   // The parent logs, the child logs: each line must appear exactly once.
   std::cout << "parent-startup-line\n";
-  cvknxd::flush_before_fork();
+  cvknx::flush_before_fork();
 
   const pid_t child = ::fork();
   ASSERT_GE(child, 0) << "fork failed";

@@ -46,8 +46,8 @@
 
 namespace {
 
-#ifndef CVKNXD_BINARY
-#error "CVKNXD_BINARY must be defined to the cometvisu-knxd-fcgi executable"
+#ifndef CVKNX_BINARY
+#error "CVKNX_BINARY must be defined to the cometvisu-knx-fcgi executable"
 #endif
 
 /// Child PIDs whose parent is @p parent (read from /proc/<pid>/stat).
@@ -105,7 +105,7 @@ protected:
     if (::access("/proc/self/stat", R_OK) != 0) {
       GTEST_SKIP() << "/proc is not available";
     }
-    char dir_template[] = "/tmp/cvknxd-supervision-XXXXXX";
+    char dir_template[] = "/tmp/cvknx-supervision-XXXXXX";
     const char* dir = ::mkdtemp(dir_template);
     ASSERT_NE(dir, nullptr) << "mkdtemp failed";
     dir_ = dir;
@@ -122,10 +122,11 @@ protected:
         ::dup2(devnull, STDERR_FILENO);
         ::close(devnull);
       }
+      ::setenv("KNX_TRANSPORT", "knxd", 1);
       ::setenv("FCGI_SOCKET", socket_path_.c_str(), 1);
       ::setenv("KNXD_SOCKET", knxd_path_.c_str(), 1);
       ::setenv("FCGI_WORKERS", "2", 1);
-      ::execl(CVKNXD_BINARY, CVKNXD_BINARY, nullptr);
+      ::execl(CVKNX_BINARY, CVKNX_BINARY, nullptr);
       ::_exit(127);
     }
 

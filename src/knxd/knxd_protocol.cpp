@@ -21,17 +21,18 @@
  * All wire-format encodings (big-endian lengths, type-tagged payloads)
  * follow the eibd specification as implemented by knxd.
  *
- * @note Single-byte values exceeding 6 bits (0x3F) are auto-promoted to
- *       the reference eibread-cgi
- *       silently truncated such values to 6 bits; we preserve the full
- *       value to support 1-byte DPTs with values > 63 (e.g. DPT 5.010).
+ * @note A value that fits into 6 bits travels inside the second APDU octet;
+ *       a longer value is placed in the following octets.  The encoder side
+ *       (WriteHandler) therefore auto-promotes a 1-byte value above 0x3F to
+ *       the multi-octet form, which is what every KNX device expects for
+ *       1-byte DPTs such as DPT 5.010.
  */
 
 #include "knxd_protocol.h"
 
 #include <cstring>
 
-namespace cvknxd {
+namespace cvknx {
 
 // ---- KnxGroupAddress ----
 
@@ -102,7 +103,19 @@ KnxGroupAddress KnxGroupAddress::from_eibaddr(uint16_t addr) {
 
 // ---- KnxAddress ----
 
-std::string KnxAddress::default_namespace_;
+namespace {
+
+/// Default namespace, held in a function-local static so that no other
+/// translation unit can observe it before it is constructed (static
+/// initialization order).  Empty means "no prefix".
+std::string& default_namespace_storage() {
+  // The guard of a function-local static is taken once per process, so the
+  // "already initialized" arm cannot appear inside a single test binary.
+  static std::string ns;  // GCOV_EXCL_BR_LINE
+  return ns;
+}
+
+}  // namespace
 
 std::optional<KnxAddress> KnxAddress::from_cometvisu(std::string_view str) {
   const auto colon = str.find(':');
@@ -112,7 +125,7 @@ std::optional<KnxAddress> KnxAddress::from_cometvisu(std::string_view str) {
     if (!group) {
       return std::nullopt;
     }
-    return KnxAddress{.ns = default_namespace_, .group = *group};
+    return KnxAddress{.ns = default_namespace_storage(), .group = *group};
   }
 
   KnxAddress result;
@@ -133,44 +146,57 @@ std::string KnxAddress::to_cometvisu() const {
 }
 
 void KnxAddress::set_default_namespace(std::string_view ns) {
-  default_namespace_ = ns;
+  default_namespace_storage() = ns;
 }
 
 std::string_view KnxAddress::get_default_namespace() {
-  return default_namespace_;
+  return default_namespace_storage();
 }
 
 // ---- APDU parsing ----
 
-bool parse_apdu(const std::vector<uint8_t>& apdu, ApduType& out_type,
-                std::vector<uint8_t>& out_data) {
+std::optional<Apdu> parse_apdu(std::span<const uint8_t> apdu) {
+  // Two octets are the minimum for every APDU; a group value always has both.
   if (apdu.size() < 2) {
-    return false;
+    return std::nullopt;
   }
 
-  out_type = static_cast<ApduType>(apdu.at(1) & 0xC0);
-  out_data.clear();
-
-  switch (out_type) {
-    case ApduType::Read:
-      // Read has no data
-      break;
-    case ApduType::Response:
-    case ApduType::Write:
-      if (apdu.size() == 2) {
-        // Single byte value packed in lower 6 bits of byte 1.
-        // Note: This limits single-byte values to 0x00–0x3F (6 bits).
-        // For values > 0x3F, use multi-byte format with data in bytes 2+.
-        out_data.push_back(apdu.at(1) & 0x3F);
-      } else {
-        // Multi-byte value: type marker is in byte 1,
-        // all data bytes follow starting at byte 2.
-        out_data.assign(apdu.begin() + 2, apdu.end());
-      }
-      break;
+  // TPCI type (bits 7..6): only "data" packets can carry a group value.
+  // Connect / disconnect / connection-oriented frames are management traffic.
+  if ((apdu[0] & 0xC0) != 0x00) {
+    return std::nullopt;
   }
 
-  return true;
+  // The 4-bit APCI is split: bits 1..0 of octet 1 are the high bits, bits 7..6
+  // of octet 2 the low bits.
+  const auto apci = static_cast<uint8_t>(((apdu[0] & 0x03) << 2) | (apdu[1] >> 6));
+
+  Apdu result;
+  switch (apci) {
+    case static_cast<uint8_t>(ApduType::Read):
+      // A_GroupValue_Read carries no value.
+      result.type = ApduType::Read;
+      return result;
+    case static_cast<uint8_t>(ApduType::Response):
+      result.type = ApduType::Response;
+      break;
+    case static_cast<uint8_t>(ApduType::Write):
+      result.type = ApduType::Write;
+      break;
+    default:
+      // Not a group value service (individual address, device descriptor,
+      // property access, reserved APCI, ...).
+      return std::nullopt;
+  }
+
+  if (apdu.size() == 2) {
+    // Value of at most 6 bits, packed into the second octet.
+    result.data.push_back(static_cast<uint8_t>(apdu[1] & 0x3F));
+  } else {
+    // Longer value: the payload starts at octet 3.
+    result.data.assign(apdu.begin() + 2, apdu.end());
+  }
+  return result;
 }
 
 // ---- EIBD Messages ----
@@ -201,9 +227,11 @@ bool parse_eibd_message(const std::vector<uint8_t>& raw, uint16_t& out_type,
     return false;  // need length(2) + type(2) minimum
   }
 
-  // Verify length
+  // Verify length.  The payload must at least hold the 2-byte type, otherwise
+  // the range below would be inverted (a malformed message must be rejected,
+  // not turned into undefined behaviour).
   const auto payload_len = static_cast<uint16_t>((raw.at(0) << 8) | raw.at(1));
-  if (raw.size() < static_cast<size_t>(payload_len) + 2) {
+  if (payload_len < 2 || raw.size() < static_cast<size_t>(payload_len) + 2) {
     return false;
   }
 
@@ -232,7 +260,10 @@ std::optional<std::vector<uint8_t>> try_extract_message(std::vector<uint8_t>& bu
 }
 
 // ---- Type-specific message builders ----
+// These are the only parts that depend on knxd's <eibtypes.h> constants, so
+// they disappear when the knxd transport is not built (KNXnet/IP needs none).
 
+#ifdef KNX_WITH_KNXD_TRANSPORT
 std::vector<uint8_t> build_open_groupcon(bool write_only) {
   // knxd >= 0.14 expects a 5-byte payload for all EIB_OPEN_* types:
   // [type:2][reserved/addr:2][write_only:1]
@@ -250,5 +281,6 @@ std::vector<uint8_t> build_group_packet(uint16_t group_addr, const std::vector<u
   data.insert(data.end(), apdu.begin(), apdu.end());
   return build_eibd_message(EIB_GROUP_PACKET, data);
 }
+#endif  // KNX_WITH_KNXD_TRANSPORT
 
-}  // namespace cvknxd
+}  // namespace cvknx

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# fcgi-curl.sh — Send HTTP-style requests to the cometvisu-knxd-fcgi backend
+# fcgi-curl.sh — Send HTTP-style requests to the cometvisu-knx-fcgi backend
 #                via FastCGI, using cgi-fcgi as the protocol bridge.
 #
 # Usage:
-#   ./tools/fcgi-curl.sh GET  '/r?a=KNX:1/2/3&t=30'
-#   ./tools/fcgi-curl.sh POST '/w' 'knx=10/20&data=0c6f&type=write'
-#   ./tools/fcgi-curl.sh POST '/l' 'user=admin&pass=secret'
+#   ./tools/fcgi-curl.sh GET  '/r?s=0&a=KNX:1/2/3&t=30'
+#   ./tools/fcgi-curl.sh POST '/w' 's=0&a=10/20&v=800c6f'
+#   ./tools/fcgi-curl.sh POST '/l' 'u=admin&p=secret'
 #
 # Environment variables:
 #   FCGI_PORT   TCP port the backend listens on (default: 9000)
@@ -14,17 +14,17 @@
 #
 # Examples (once the backend is running via "Run against real knxd"):
 #
-#   # Login (creates a session)
-#   ./tools/fcgi-curl.sh POST '/l' 'user=admin&pass=admin'
+#   # Login (creates a session; the anonymous id is "0")
+#   ./tools/fcgi-curl.sh POST '/l' 'u=admin&p=admin'
 #
-#   # Read an address from knxd cache
-#   ./tools/fcgi-curl.sh GET '/r?a=KNX:1/2/3&t=5'
+#   # Read an address from the cache (s= is mandatory, "0" = anonymous)
+#   ./tools/fcgi-curl.sh GET '/r?s=0&a=KNX:1/2/3&t=5'
 #
-#   # Write a value
-#   ./tools/fcgi-curl.sh POST '/w' 'knx=10/20&data=0c6f&type=write'
+#   # Write a value (v carries the APCI byte, "80" + value)
+#   ./tools/fcgi-curl.sh POST '/w' 's=0&a=10/20&v=800c6f'
 #
 #   # Read with long-poll (waits up to 30 seconds for a telegram)
-#   ./tools/fcgi-curl.sh GET '/r?a=KNX:1/2/3&t=30'
+#   ./tools/fcgi-curl.sh GET '/r?s=0&a=KNX:1/2/3&t=30'
 
 set -euo pipefail
 

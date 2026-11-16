@@ -28,6 +28,7 @@
 
 #include "read_handler.h"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -36,34 +37,45 @@
 #include <string>
 #include <vector>
 
-#include "knxd/knxd_client.h"
+#include "bus/bus_link.h"
+#include "bus_status_json.h"
 #include "knxd/knxd_protocol.h"
-#include "knxd_status_json.h"
 #include "state/session_store.h"
 #include "state/shared_group_cache.h"
 #include "util/hex.h"
 #include "util/json_builder.h"
 #include "util/query_string.h"
 
-namespace cvknxd {
+namespace cvknx {
 
-ReadHandler::ReadHandler(SharedGroupCache& cache, KnxdClientInterface& knxd, SessionStore& sessions,
-                         int longpoll_timeout_sec)
+/// Clamp a client supplied `t` to the hard wait limit.
+///
+/// `t` is both the age filter and the long-poll duration, so an unclamped
+/// value would let one request occupy a worker for years.
+int clamp_client_wait(int requested_sec) {
+  return requested_sec > kMaxClientWaitSec ? kMaxClientWaitSec : requested_sec;
+}
+
+ReadHandler::ReadHandler(SharedGroupCache& cache, BusLink& knxd, SessionStore& sessions,
+                         int longpoll_timeout_sec, std::string outage_key)
     : cache_(cache),
       knxd_(knxd),
       sessions_(sessions),
-      longpoll_timeout_sec_(longpoll_timeout_sec) {}
+      longpoll_timeout_sec_(std::clamp(longpoll_timeout_sec, 1, kMaxClientWaitSec)),
+      outage_key_(std::move(outage_key)) {}
 
-std::optional<int> ReadHandler::parse_timeout(std::string_view t_str) {
-  if (t_str.empty()) {
+std::optional<int> ReadHandler::parse_int_parameter(std::string_view text) {
+  if (text.empty()) {
     return std::nullopt;
   }
   int val = 0;
-  const auto [ptr, ec] = std::from_chars(t_str.data(), t_str.data() + t_str.size(), val);
+  const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), val);
   if (ec != std::errc{}) {
     return std::nullopt;
   }
-  if (ptr != t_str.data() + t_str.size()) {
+  // from_chars stops at the first non-digit; an unconsumed tail means the
+  // parameter is not a number (e.g. "12abc").
+  if (ptr != text.data() + text.size()) {
     return std::nullopt;
   }
   return val;
@@ -81,19 +93,28 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     return result;
   }
 
+  // ---- Session: the protocol requires `s` on every request ----
+  // A request without a session id is not a read: answer 401 instead of
+  // serving values to a client that never logged in.  The anonymous session
+  // "0" (returned by /l when no credentials are sent) is a valid session id.
+  const auto session = params.get("s");
+  if (!session) {
+    result.http_status = 401;
+    result.body = R"({"error":"missing session"})";
+    return result;
+  }
+  if (!sessions_.is_valid(*session)) {
+    result.http_status = 401;
+    result.body = R"({"error":"invalid session"})";
+    return result;
+  }
+
   // ---- Parse parameters ----
   const auto addresses = params.get_all("a");
   if (addresses.empty()) {
     result.http_status = 400;
     result.body = R"({"error":"missing address"})";
     return result;
-  }
-  if (auto s_opt = params.get("s")) {
-    if (!sessions_.is_valid(*s_opt)) {
-      result.http_status = 401;
-      result.body = R"({"error":"invalid session"})";
-      return result;
-    }
   }
   // ---- Parse t= parameter (poll timeout AND age filter) ----
   // Per spec (https://github.com/CometVisu/CometVisu/wiki/Protokoll):
@@ -105,7 +126,7 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   bool t_provided = false;
   int t_original = 0;
   if (auto t_opt = params.get("t")) {
-    const auto parsed = parse_timeout(*t_opt);
+    const auto parsed = parse_int_parameter(*t_opt);
     if (!parsed) {
       result.http_status = 400;
       result.body = R"({"error":"invalid timeout"})";
@@ -113,7 +134,9 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     }
     t_provided = true;
     t_original = *parsed;
-    timeout_sec = *parsed;
+    // No request may wait longer than the hard limit: a client could
+    // otherwise pin a worker for years (the value *is* the wait).
+    timeout_sec = clamp_client_wait(*parsed);
   }
 
   // Age filter: only active when t > 0 (spec: "maximal TIMEOUT Sekunden alt").
@@ -124,7 +147,7 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
 
   uint32_t lastpos = 0;
   if (auto i_opt = params.get("i")) {
-    const auto parsed = parse_timeout(*i_opt);
+    const auto parsed = parse_int_parameter(*i_opt);
     if (parsed && *parsed >= 0) {
       lastpos = static_cast<uint32_t>(*parsed);
     }
@@ -154,10 +177,12 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     return result;
   }
 
-  auto addr_key = [](uint16_t a) -> std::string {
-    return KnxAddress{.ns = std::string{KnxAddress::get_default_namespace()},
-                      .group = KnxGroupAddress::from_eibaddr(a)}
-        .to_cometvisu();
+  // GCOV_EXCL_BR_LINE - the branches on the next line come from the inlined
+  // std::string member of KnxAddress, not from a source-level condition.
+  const auto addr_key = [](uint16_t a) -> std::string {
+    KnxAddress address;
+    address.group = KnxGroupAddress::from_eibaddr(a);
+    return address.to_cometvisu();
   };
 
   JsonBuilder json;
@@ -173,14 +198,21 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   //   t > 0         → t  (spec: "maximal TIMEOUT Sekunden alt")
   //   t < 0         → -1 (no age filter, "nur aus dem Cache")
   if (lastpos == 0) {
+    // One atomic snapshot: values and position are read under the same lock.
+    // Reading the values first and the position afterwards loses a telegram
+    // that is pushed in between — the reported `i` would already cover it, so
+    // the value could never be delivered (no later delta matches it).
+    const auto snapshot = cache_.get_delta(0, eib_addrs, max_age_sec);
+    // Iterate the requested addresses (not the returned hash map) so the JSON
+    // key order stays deterministic.
     for (auto addr : eib_addrs) {
-      auto cached = cache_.get(addr, max_age_sec);
-      if (cached) {
-        json.add_string(addr_key(addr), hex_encode(cached->data(), cached->size()));
+      const auto it = snapshot.values.find(addr);
+      if (it != snapshot.values.end()) {
+        json.add_string(addr_key(addr), hex_encode(it->second.data(), it->second.size()));
         already_written.insert(addr);
       }
     }
-    lastpos = cache_.position();
+    lastpos = snapshot.position;
   }
 
   // ---- t=0: send GroupValueRead for uncached addresses ----
@@ -192,8 +224,15 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     // Build GroupValueRead APDU: [0x00, 0x00] = A_GroupValue_Read
     const std::vector<uint8_t> read_apdu = {0x00, 0x00};
     for (auto addr : eib_addrs) {
-      if (!already_written.contains(addr)) {
-        knxd_.send_group_packet(addr, read_apdu);
+      if (already_written.contains(addr)) {
+        continue;
+      }
+      if (!knxd_.send_group_packet(addr, read_apdu)) {
+        // The bus is unreachable or the shared TX ring is full.  Generating
+        // more telegrams would only hammer a queue that cannot accept them;
+        // these bus reads are best effort (the answer already carries the
+        // cached values), so stop here instead of flooding the ring.
+        break;
       }
     }
   }
@@ -202,16 +241,42 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   // Waiting for the full long-poll timeout and only then reporting the outage
   // would keep the client from ever showing it.  Report right away instead;
   // the response still carries the last known values and the outage block.
-  if (timeout_sec > 0 && !cache_.knxd_status().available) {
+  if (timeout_sec > 0 && !cache_.bus_status().available) {
     timeout_sec = 0;
   }
 
-  // ---- Poll loop — wait on shared condition variable, query delta ----
+  // ---- Poll loop — query delta, then wait on the shared condition variable ----
   auto tstart = std::chrono::steady_clock::now();
   bool written = !already_written.empty();
 
   while (timeout_sec > 0) {
     // If the initial read already delivered data, skip the poll loop.
+    if (written) {
+      break;
+    }
+
+    // Query the cache for entries newer than the client's last-known position
+    // *before* blocking.  Telegrams that arrived between two requests are
+    // already in the cache; waiting for the condition variable first would
+    // delay them until the next telegram — on a quiet bus possibly for hours.
+    // max_age_sec follows the spec:
+    //   t > 0 → entries ≤ t seconds old; t=0/t<0/no-t → no age filter.
+    // The position-based filter (pushed_at > lastpos) guarantees we only
+    // return new data.  Age filtering is an additional constraint per spec.
+    auto delta = cache_.get_delta(lastpos, eib_addrs, max_age_sec);
+
+    // already_written is empty here: as soon as it holds anything the loop is
+    // left above, so no duplicate check is needed.
+    for (const auto& [addr, val] : delta.values) {
+      json.add_string(addr_key(addr), hex_encode(val.data(), val.size()));
+      already_written.insert(addr);
+      written = true;
+    }
+
+    // Position comes from the shared cache — single source of truth,
+    // monotonically increasing across all workers.
+    lastpos = delta.position;
+
     if (written) {
       break;
     }
@@ -230,29 +295,6 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     if (!new_data) {
       break;
     }
-
-    // Query cache for entries newer than the client's last-known position.
-    // max_age_sec follows the spec:
-    //   t > 0 → entries ≤ t seconds old; t=0/t<0/no-t → no age filter.
-    // The position-based filter (pushed_at > lastpos) guarantees we only
-    // return new data.  Age filtering is an additional constraint per spec.
-    auto delta = cache_.get_delta(lastpos, eib_addrs, max_age_sec);
-
-    for (const auto& [addr, val] : delta.values) {
-      if (!already_written.contains(addr)) {
-        json.add_string(addr_key(addr), hex_encode(val.data(), val.size()));
-        already_written.insert(addr);
-        written = true;
-      }
-    }
-
-    // Position comes from the shared cache — single source of truth,
-    // monotonically increasing across all workers.
-    lastpos = delta.position;
-
-    if (written) {
-      break;
-    }
   }
 
   json.end_object();  // d
@@ -263,12 +305,12 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   // "connection lost" — it would show frozen values indefinitely.
   // A read is also not successful while the bus connection is gone, so it
   // answers 503; the body still carries the last known values.
-  const auto knxd_status = cache_.knxd_status();
-  add_knxd_outage(json, knxd_status);
+  const auto bus_status = cache_.bus_status();
+  add_bus_outage(json, bus_status, outage_key_);
 
   json.end_object();  // root
 
-  if (!knxd_status.available) {
+  if (!bus_status.available) {
     result.http_status = 503;
   }
 
@@ -276,4 +318,4 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   return result;
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

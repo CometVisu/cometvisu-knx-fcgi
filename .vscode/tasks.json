@@ -47,7 +47,7 @@
         "-j",
         "${nproc}",
         "--target",
-        "cometvisu-knxd-fcgi"
+        "cometvisu-knx-fcgi"
       ],
       "group": "build",
       "problemMatcher": [
@@ -209,7 +209,7 @@
     {
       "label": "Run against real knxd",
       "type": "shell",
-      "command": "${workspaceFolder}/build/src/cometvisu-knxd-fcgi",
+      "command": "${workspaceFolder}/build/src/cometvisu-knx-fcgi",
       "isBackground": true,
       "dependsOn": [
         "cmake-build-main"
@@ -233,7 +233,7 @@
         ],
         "background": {
           "activeOnStart": true,
-          "beginsPattern": "^\\[INFO\\] cometvisu-knxd-fcgi starting",
+          "beginsPattern": "^\\[INFO\\] cometvisu-knx-fcgi starting",
           "endsPattern": "^\\[INFO\\] Direct FCGI socket:"
         }
       },
@@ -242,7 +242,7 @@
     {
       "label": "Run with local knxd (E2E)",
       "type": "shell",
-      "command": "${workspaceFolder}/build/src/cometvisu-knxd-fcgi",
+      "command": "${workspaceFolder}/build/src/cometvisu-knx-fcgi",
       "isBackground": true,
       "dependsOn": [
         "build-and-start-knxd-ipt"
@@ -267,7 +267,7 @@
         ],
         "background": {
           "activeOnStart": true,
-          "beginsPattern": "^\\[INFO\\] cometvisu-knxd-fcgi starting",
+          "beginsPattern": "^\\[INFO\\] cometvisu-knx-fcgi starting",
           "endsPattern": "^\\[INFO\\] Direct FCGI socket:"
         }
       },

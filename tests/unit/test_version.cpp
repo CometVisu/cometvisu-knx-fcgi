@@ -17,14 +17,14 @@
 
 #include "version.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-  EXPECT_EQ(version(), "1.2.1");
+  EXPECT_EQ(version(), "2.0.0");
 }
 
 TEST(VersionTest, ApplicationName) {
-  EXPECT_EQ(application_name(), "cometvisu-knxd-fcgi");
+  EXPECT_EQ(application_name(), "cometvisu-knx-fcgi");
 }
 
 TEST(VersionTest, VersionStringNotEmpty) {

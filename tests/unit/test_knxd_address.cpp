@@ -20,7 +20,7 @@
 
 #include "knxd/knxd_protocol.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 // Additional edge case tests for the protocol layer
 

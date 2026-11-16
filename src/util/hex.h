@@ -29,7 +29,7 @@
 #include <string_view>
 #include <vector>
 
-namespace cvknxd {
+namespace cvknx {
 
 /// Convert a hex string (e.g. "0c6f") to bytes.
 /// @param hex Input hex string, lowercase or uppercase, no spaces.
@@ -42,4 +42,4 @@ namespace cvknxd {
 /// Convert a byte to a 2-char hex string (e.g. 0x42 → "42").
 [[nodiscard]] std::string hex_byte(uint8_t byte);
 
-}  // namespace cvknxd
+}  // namespace cvknx

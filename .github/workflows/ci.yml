@@ -51,7 +51,9 @@ jobs:
             g++ \
             clang \
             libfcgi-dev \
-            knxd-dev
+            knxd-dev \
+            knxd \
+            knxd-tools
 
       - name: Configure (Debug)
         run: |
@@ -70,7 +72,9 @@ jobs:
         # --timeout bounds every single test: a hanging test (e.g. a leaked
         # worker holding ctest's output pipe) must fail the job within
         # seconds instead of blocking the workflow.
-        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --timeout 120
+        # knxd/knxtool are installed, so the black-box interop suites drive a
+        # real KNXnet/IP router and tunnel server (see tests/e2e).
+        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --timeout 300
 
       - name: Configure (Release)
         run: |
@@ -86,4 +90,140 @@ jobs:
         run: cmake --build ${{ env.BUILD_DIR }}_release -j$(nproc)
 
       - name: Run tests (Release)
-        run: ctest --test-dir ${{ env.BUILD_DIR }}_release --output-on-failure --timeout 120
+        run: ctest --test-dir ${{ env.BUILD_DIR }}_release --output-on-failure --timeout 300
+
+  no-knxd:
+    # The KNXnet/IP transports must build and work without any knxd dependency.
+    # This job deliberately does *not* install knxd-dev: with
+    # -DKNX_BUILD_KNXD_TRANSPORT=OFF the build must succeed without
+    # <eibtypes.h>, and the knxd-only test targets are not registered.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (no knxd)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            libfcgi-dev
+
+      - name: Verify no knxd header is available
+        run: |
+          if find /usr/include -name eibtypes.h | grep -q .; then
+            echo "knxd-dev must not be installed in this job" >&2
+            exit 1
+          fi
+
+      - name: Configure
+        run: |
+          cmake -B ${{ env.BUILD_DIR }} \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DKNX_BUILD_KNXD_TRANSPORT=OFF
+
+      - name: Build
+        run: cmake --build ${{ env.BUILD_DIR }} -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --timeout 120
+
+  coverage:
+    # Coverage is measured on every pull request (and on main, so the baseline
+    # cannot silently drift).  gcc only: the gate reads gcov counters.
+    #
+    # Pinned to 24.04 so the gcc release matches the one the baseline was
+    # recorded with — branch arm counts differ between gcc versions.  The gate
+    # additionally allows a small tolerance for baselined files.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      COVERAGE_BUILD_DIR: build-cov
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            libfcgi-dev \
+            knxd-dev
+
+      - name: Configure (Debug, instrumented)
+        run: |
+          cmake -B ${{ env.COVERAGE_BUILD_DIR }} \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build ${{ env.COVERAGE_BUILD_DIR }} -j$(nproc)
+
+      - name: Run tests
+        # The tests produce the .gcda counters the gate reads.  Stale counters
+        # from a previous build would be rejected by gcov, so start clean.
+        run: |
+          find ${{ env.COVERAGE_BUILD_DIR }} -name '*.gcda' -delete
+          # The gate itself is excluded here: it is run in the next step so the
+          # report always reaches the job summary, even when it fails.
+          ctest --test-dir ${{ env.COVERAGE_BUILD_DIR }} --output-on-failure \
+                --timeout 120 -E coverage_gate
+
+      - name: Coverage gate
+        # Fails the pull request when any file drops below its recorded value
+        # in tools/coverage-baseline.json, or when a file that is not in the
+        # baseline (i.e. new code) is not fully covered (line + branch arm).
+        run: |
+          set +e
+          python3 tools/check_coverage.py \
+              --build-dir ${{ env.COVERAGE_BUILD_DIR }} \
+              --baseline tools/coverage-baseline.json \
+              --tolerance 1 \
+              --report > coverage-report.txt 2>&1
+          status=$?
+          {
+            echo '### Code coverage (gcov)'
+            echo ''
+            echo '<details><summary>Per-file lines and branch arms</summary>'
+            echo ''
+            echo '```'
+            cat coverage-report.txt
+            echo '```'
+            echo ''
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ $status -ne 0 ]; then
+            python3 tools/check_coverage.py \
+                --build-dir ${{ env.COVERAGE_BUILD_DIR }} \
+                --baseline tools/coverage-baseline.json \
+                --tolerance 1 \
+                --list-uncovered > coverage-gaps.txt 2>&1
+            {
+              echo '### Uncovered code'
+              echo ''
+              echo '```'
+              cat coverage-gaps.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-report.txt
+            coverage-gaps.txt
+          if-no-files-found: ignore
+          retention-days: 14
+

@@ -35,17 +35,17 @@
 
 #include "../../src/knxd/knxd_client.h"
 
-namespace cvknxd {
+namespace cvknx {
 namespace {
 
-using WaitResult = KnxdClientInterface::WaitResult;
+using WaitResult = BusLink::WaitResult;
 
 /// Minimal Unix stream socket listener that stands in for knxd.
 class FakeKnxdListener {
 public:
   FakeKnxdListener() : fd_(::socket(AF_UNIX, SOCK_STREAM, 0)) {
     static int counter = 0;
-    path_ = "/tmp/cvknxd-test-" + std::to_string(::getpid()) + "-" + std::to_string(counter++) +
+    path_ = "/tmp/cvknx-test-" + std::to_string(::getpid()) + "-" + std::to_string(counter++) +
             ".sock";
     if (fd_ < 0) {
       return;
@@ -217,4 +217,4 @@ TEST(KnxdClientTest, OpenGroupSocketSucceedsWhenKnxdAnswersTheHandshake) {
 }
 
 }  // namespace
-}  // namespace cvknxd
+}  // namespace cvknx

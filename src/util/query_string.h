@@ -38,7 +38,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace cvknxd {
+namespace cvknx {
 
 /**
  * @brief Transparent hash for heterogeneous lookup with string_view in
@@ -120,4 +120,4 @@ private:
   bool limit_exceeded_ = false;
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

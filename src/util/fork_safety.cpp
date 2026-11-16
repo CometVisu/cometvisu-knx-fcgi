@@ -23,7 +23,7 @@
 #include <cstdio>
 #include <iostream>
 
-namespace cvknxd {
+namespace cvknx {
 
 void flush_before_fork() {
   // The C++ streams may be detached from stdio (std::ios::sync_with_stdio),
@@ -36,4 +36,4 @@ void flush_before_fork() {
   (void)::fflush(nullptr);
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

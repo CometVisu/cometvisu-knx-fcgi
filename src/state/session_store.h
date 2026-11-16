@@ -17,74 +17,152 @@
  * @file session_store.h
  * @brief CometVisu session management — creation, validation, expiry.
  *
- * Sessions are identified by 16-character hex strings generated from a
- * Mersenne Twister PRNG (mt19937_64).  Anonymous sessions use the special
- * id "0" which is always considered valid.
+ * **Sessions must be shared by every worker process.**  A CometVisu client
+ * logs in once (`/l`) and then sends `s=<id>` with every `/r` and `/w` — and
+ * those requests are handled by *any* worker of the fork-based pool.  A
+ * per-process store would make the session valid in exactly one of
+ * `FCGI_WORKERS` processes (verified: with four workers every follow-up
+ * request answered 401).  The store therefore lives in
+ * mmap(MAP_SHARED|MAP_ANONYMOUS) memory, created before fork(), exactly like
+ * the group cache and the TX ring.
  *
- * Thread safety: all public methods are guarded by std::mutex.
+ * Sessions are identified by 16-character hex strings.  Anonymous sessions
+ * use the special id "0", which is always valid and never occupies a slot.
+ *
+ * Capacity is a runtime value (`SESSION_MAX`): the slot array is sized once,
+ * in the parent, before fork().  When the table is full the **oldest session**
+ * is evicted, so a client that logs in again always finds room.
+ *
+ * Session lifetime is deliberately *not* tied to the long-poll timeout: a
+ * session lives for `ttl` seconds (default 30 minutes, `SESSION_TTL_SEC`)
+ * while no single HTTP request may wait longer than a few minutes.
+ *
+ * Thread/process safety: every public method takes the process-shared robust
+ * mutex; there is no unlocked public mutator.
  */
 
 #pragma once
 
-#include <chrono>
-#include <mutex>
+#include <pthread.h>
+
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <type_traits>
 
-namespace cvknxd {
+namespace cvknx {
+
+/// Default maximum number of concurrent named sessions.
+inline constexpr std::size_t kDefaultMaxSessions = 10000;
+/// Smallest accepted capacity (tests use tiny values to exercise eviction).
+inline constexpr std::size_t kMinMaxSessions = 1;
+/// Largest accepted capacity (guards against a nonsense environment value).
+inline constexpr std::size_t kMaxMaxSessions = 1'000'000;
+/// Length of a session id in characters (64 bits, hex encoded).
+inline constexpr std::size_t kSessionIdChars = 16;
+/// Anonymous session id — always valid, never stored.
+inline constexpr std::string_view kAnonymousSessionId = "0";
+
+/// One session slot.  Must be trivially copyable (shared memory).
+struct SharedSessionEntry {
+  /// Session id (NUL terminated).  An empty id marks a free slot.
+  char id[kSessionIdChars + 1] = {};
+  std::uint32_t created = 0;    ///< Unix time (s) of creation
+  std::uint32_t last_used = 0;  ///< Unix time (s) of the last validation
+  std::uint64_t seq = 0;        ///< creation order (monotonic, tie breaker)
+};
+static_assert(std::is_trivially_copyable_v<SharedSessionEntry>,
+              "SharedSessionEntry must be POD for shared memory");
+
+/// Fixed part of the shared session region; the slots follow it.
+struct SharedSessionData {
+  alignas(64) pthread_mutex_t mutex;
+  std::uint32_t capacity = 0;   ///< slots in this region
+  std::uint32_t count = 0;      ///< slots in use
+  std::uint32_t ttl_sec = 0;    ///< session lifetime
+  std::uint64_t next_seq = 1;   ///< next creation sequence number
+  std::uint64_t evictions = 0;  ///< lifetime counter (diagnostics)
+};
+
+/// Size of the shared region for @p max_sessions slots.
+[[nodiscard]] std::size_t session_region_size(std::size_t max_sessions);
 
 /**
- * @brief Stores active CometVisu sessions with their metadata.
+ * @brief Stores active CometVisu sessions in shared memory.
  *
- * Sessions expire after a configurable TTL (default: 30 minutes).
- * A maximum number of concurrent sessions is enforced (default: 10000);
- * when the limit is reached, the oldest session is evicted.
- *
- * @note Anonymous sessions use the fixed id "0" and are always valid.
- * @note Thread-safe: all public methods are guarded by std::mutex.
+ * The constructor creates the shared region, so it must run in the parent
+ * process before fork().  `attach()` exists for tests (and for any future
+ * helper process) that reuse an existing region.
  */
 class SessionStore {
 public:
-  /// Default session TTL in seconds.
-  static constexpr int kDefaultSessionTtlSec = 1800;  // 30 minutes
-  /// Default maximum number of concurrent sessions.
-  static constexpr size_t kDefaultMaxSessions = 10000;
+  /// Default session TTL in seconds (30 minutes).
+  static constexpr int kDefaultSessionTtlSec = 1800;
 
+  /// Create the shared region.
+  /// @param session_ttl_sec Lifetime of a session.
+  /// @param max_sessions Number of concurrent sessions (oldest is evicted).
   explicit SessionStore(int session_ttl_sec = kDefaultSessionTtlSec,
-                        size_t max_sessions = kDefaultMaxSessions);
+                        std::size_t max_sessions = kDefaultMaxSessions);
+  ~SessionStore();
 
-  /// Create a new session. Returns the session ID.
-  /// If the maximum session count is reached, the oldest session is evicted.
-  /// @param anonymous If true, creates an anonymous session (ID = "0").
+  SessionStore(const SessionStore&) = delete;
+  SessionStore& operator=(const SessionStore&) = delete;
+  SessionStore(SessionStore&&) = delete;
+  SessionStore& operator=(SessionStore&&) = delete;
+
+  /// Attach to an existing region (tests, child processes).
+  void attach(SharedSessionData* data);
+
+  /// Whether the region exists (creation succeeded or attach() was called).
+  [[nodiscard]] bool is_initialized() const { return data_ != nullptr; }
+
+  /// Create a new session and return its id.
+  /// @param anonymous If true, returns the always-valid anonymous id "0".
+  /// @return the session id, or an empty string only when the shared region
+  ///         could not be created (out of memory).
   [[nodiscard]] std::string create_session(bool anonymous = false);
 
-  /// Check if a session exists and is valid (not expired).
-  /// Expired sessions are automatically cleaned up.
+  /// Check that a session exists and has not expired.  Expired sessions are
+  /// removed on the way.
   [[nodiscard]] bool is_valid(std::string_view session_id);
 
-  /// Remove a session.
+  /// Remove a session (no-op for the anonymous id and unknown ids).
   void remove(std::string_view session_id);
 
-  /// Remove all expired sessions. Called automatically on create_session()
-  /// and is_valid().
+  /// Remove every expired session.
   void cleanup_expired();
 
-  /// Get the number of active (non-expired) sessions.
-  [[nodiscard]] size_t count() const { return sessions_.size(); }
+  /// Number of active sessions (the anonymous session is not counted).
+  [[nodiscard]] std::size_t count() const;
+
+  /// Number of slots in the region.
+  [[nodiscard]] std::size_t capacity() const;
+
+  /// Number of sessions dropped because the table was full.
+  [[nodiscard]] std::uint64_t evictions() const;
+
+  /// Raw region pointer (for passing to child processes).
+  [[nodiscard]] SharedSessionData* data() { return data_; }
+
+  /// Size of the shared region in bytes.
+  [[nodiscard]] static std::size_t region_size(std::size_t max_sessions = kDefaultMaxSessions) {
+    return session_region_size(max_sessions);
+  }
 
 private:
-  struct Session {
-    std::string id;
-    std::chrono::steady_clock::time_point created;
-  };
+  /// Slot holding @p id, or -1.  Caller holds the mutex.
+  [[nodiscard]] int32_t find_locked(std::string_view id) const;
+  /// Free all expired slots and return the number removed.  Caller holds the mutex.
+  std::size_t cleanup_locked(std::uint32_t now);
+  /// Slot to use for a new session; evicts the oldest one when full.
+  /// Caller holds the mutex.
+  [[nodiscard]] int32_t allocate_locked();
 
-  std::unordered_map<std::string, Session> sessions_;
-  mutable std::mutex mutex_;
-  int session_ttl_sec_;
-  size_t max_sessions_;
-
-  [[nodiscard]] static std::string generate_id();
+  SharedSessionData* data_ = nullptr;
+  bool owns_mmap_ = false;
+  std::size_t bytes_ = 0;
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx
