@@ -39,6 +39,20 @@ namespace cvknx {
 
 /// Ring capacity (telegrams in flight).
 inline constexpr std::size_t kTxQueueCapacity = 256;
+/// Capacity of the pending-read ring (group addresses, no payload).
+///
+/// Requests are kept in their own ring because a cold-cache refresh (a `t=0`
+/// read over every address of a large CometVisu config) must never queue in
+/// front of a write: the cache reader always drains this ring *after* the
+/// write ring.
+///
+/// Sized for a maximal address list, twice: one `a` parameter may carry 4096
+/// addresses (`QueryString::kMaxValuesPerKey`), and a client sends `t=0` only
+/// once when it starts — a list that did not fit would leave the tail of the
+/// visualization without values forever, because nothing would ask the bus for
+/// those addresses again.  (The ring wastes one slot on its full/empty mark,
+/// so 8192 slots hold 8191 requests: one maximal client plus most of a second.)
+inline constexpr std::size_t kReadQueueCapacity = 8192;
 /// Maximum APDU bytes per telegram.
 inline constexpr std::size_t kMaxTxValueBytes = 14;
 
@@ -58,6 +72,13 @@ struct SharedTxQueueData {
   std::uint64_t pushed = 0;          ///< lifetime counter (diagnostics/tests)
   std::uint64_t dropped = 0;         ///< lifetime rejections (full queue)
   TxSlot slots[kTxQueueCapacity]{};  // NOLINT(modernize-avoid-c-arrays)
+
+  // ---- Pending A_GroupValue_Read requests (lower priority than writes) ----
+  std::uint32_t read_head = 0;                     ///< read index of the request ring
+  std::uint32_t read_tail = 0;                     ///< write index of the request ring
+  std::uint64_t reads_pushed = 0;                  ///< lifetime counter (diagnostics/tests)
+  std::uint64_t reads_dropped = 0;                 ///< lifetime rejections (full ring)
+  std::uint16_t read_slots[kReadQueueCapacity]{};  // NOLINT(modernize-avoid-c-arrays)
 };
 
 /**
@@ -104,6 +125,25 @@ public:
 
   /// Number of queued telegrams.
   [[nodiscard]] std::size_t size() const;
+
+  /// Queue an `A_GroupValue_Read` for @p group_addr.
+  ///
+  /// Reads are kept apart from the write ring: the cache reader sends them
+  /// only when no write is waiting, so a `t=0` refresh of a large address list
+  /// cannot delay a switch press.  A read that is already pending is not
+  /// queued twice (the answer is shared by every client through the cache).
+  /// @return false only when the read ring is full (or not initialized).
+  [[nodiscard]] bool push_read(std::uint16_t group_addr);
+
+  /// Look at the oldest pending read request without removing it.
+  [[nodiscard]] bool peek_read(std::uint16_t& out_group_addr) const;
+
+  /// Remove the oldest pending read request (the one last returned by
+  /// peek_read()).
+  void pop_read_drop();
+
+  /// Number of queued read requests.
+  [[nodiscard]] std::size_t read_size() const;
 
   /// Wake the reader (writes to the inherited eventfd).  No-op without one.
   void signal();

@@ -62,6 +62,19 @@ public:
   [[nodiscard]] virtual bool send_group_packet(uint16_t group_addr,
                                                const std::vector<uint8_t>& apdu) = 0;
 
+  /// Ask the bus for the current value of one group address
+  /// (`A_GroupValue_Read`).
+  ///
+  /// Separate from send_group_packet() because the request is not urgent: a
+  /// worker queues it in the lower-priority read ring of the shared TX queue,
+  /// so a cold-cache refresh of a large address list can never delay a write.
+  /// A link without a queue (the cache reader, tests) sends it immediately.
+  /// @return false when the request was rejected (ring full, bus down).
+  [[nodiscard]] virtual bool request_group_read(uint16_t group_addr) {
+    const std::vector<uint8_t> read_apdu{0x00, 0x00};  // A_GroupValue_Read
+    return send_group_packet(group_addr, read_apdu);
+  }
+
   /// Try to receive one group telegram without blocking.
   /// @return true if a telegram was consumed.
   [[nodiscard]] virtual bool poll_group_telegram(uint16_t& out_group_addr,

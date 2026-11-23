@@ -233,6 +233,83 @@ void SharedTxQueue::pop_drop() {
   }
 }
 
+bool SharedTxQueue::push_read(std::uint16_t group_addr) {
+  if (data_ == nullptr) {
+    return false;
+  }
+  QueueLock lock(data_->mutex);
+  // GCOV_EXCL_START - a hard lock error needs a corrupted mutex
+  if (!lock.acquired()) {
+    return false;
+  }
+  // GCOV_EXCL_STOP
+  // An address that is already pending is reported as accepted: the telegram
+  // is in flight, and a second read would only make the bus answer twice.
+  for (std::uint32_t i = data_->read_head; i != data_->read_tail;
+       i = (i + 1) % kReadQueueCapacity) {
+    if (data_->read_slots[i] == group_addr) {
+      return true;
+    }
+  }
+  const std::uint32_t next = (data_->read_tail + 1) % kReadQueueCapacity;
+  if (next == data_->read_head) {
+    ++data_->reads_dropped;
+    return false;  // full
+  }
+  data_->read_slots[data_->read_tail] = group_addr;
+  data_->read_tail = next;
+  ++data_->reads_pushed;
+  return true;
+}
+
+bool SharedTxQueue::peek_read(std::uint16_t& out_group_addr) const {
+  if (data_ == nullptr) {
+    return false;
+  }
+  QueueLock lock(data_->mutex);
+  // GCOV_EXCL_START - a hard lock error needs a corrupted mutex
+  if (!lock.acquired()) {
+    return false;
+  }
+  // GCOV_EXCL_STOP
+  if (data_->read_head == data_->read_tail) {
+    return false;
+  }
+  out_group_addr = data_->read_slots[data_->read_head];
+  return true;
+}
+
+void SharedTxQueue::pop_read_drop() {
+  if (data_ == nullptr) {
+    return;
+  }
+  QueueLock lock(data_->mutex);
+  // GCOV_EXCL_START - a hard lock error needs a corrupted mutex
+  if (!lock.acquired()) {
+    return;
+  }
+  // GCOV_EXCL_STOP
+  if (data_->read_head != data_->read_tail) {
+    data_->read_head = (data_->read_head + 1) % kReadQueueCapacity;
+  }
+}
+
+std::size_t SharedTxQueue::read_size() const {
+  if (data_ == nullptr) {
+    return 0;
+  }
+  QueueLock lock(data_->mutex);
+  // GCOV_EXCL_START - a hard lock error needs a corrupted mutex
+  if (!lock.acquired()) {
+    return 0;
+  }
+  // GCOV_EXCL_STOP
+  if (data_->read_tail >= data_->read_head) {
+    return data_->read_tail - data_->read_head;
+  }
+  return kReadQueueCapacity - data_->read_head + data_->read_tail;
+}
+
 void SharedTxQueue::signal() {
   if (eventfd_ < 0) {
     return;

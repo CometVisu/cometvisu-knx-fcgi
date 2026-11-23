@@ -43,6 +43,8 @@ public:
   [[nodiscard]] bool is_connected() const override;
   [[nodiscard]] bool send_group_packet(uint16_t group_addr,
                                        const std::vector<uint8_t>& apdu) override;
+  /// Counts the calls and delegates to send_group_packet() with the read APDU.
+  [[nodiscard]] bool request_group_read(uint16_t group_addr) override;
   [[nodiscard]] bool poll_group_telegram(uint16_t& out_group_addr,
                                          std::vector<uint8_t>& out_apdu) override;
   [[nodiscard]] int get_fd() const override;
@@ -78,6 +80,10 @@ public:
   [[nodiscard]] int connect_calls() const { return connect_calls_; }
   /// Number of wait_for_activity() calls so far (used to detect busy loops).
   [[nodiscard]] int wait_calls() const { return wait_calls_; }
+  /// Number of request_group_read() calls so far (the t=0 bus-read path).
+  [[nodiscard]] int read_request_calls() const { return read_request_calls_; }
+  /// Make the next @p count group-read requests fail (a full read ring).
+  void set_read_request_fail_count(int count) { read_fail_count_ = count; }
 
 private:
   bool connected_ = false;
@@ -87,6 +93,8 @@ private:
   int wait_error_count_ = 0;
   int connect_calls_ = 0;
   int wait_calls_ = 0;
+  int read_request_calls_ = 0;
+  int read_fail_count_ = 0;
   std::string last_socket_path_;
   std::queue<std::pair<uint16_t, std::vector<uint8_t>>> telegram_queue_;
   std::vector<SentPacket> sent_packets_;

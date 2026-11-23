@@ -83,5 +83,45 @@ TEST_F(SharedTxBusLinkTest, NeverReceivesAndHasNoFd) {
   EXPECT_TRUE(link.is_connected());
 }
 
+/// A `t=0` bus read is queued in the read ring, not in the write ring: it must
+/// never overtake (or occupy the space of) a switch press.
+TEST_F(SharedTxBusLinkTest, GroupReadGoesIntoTheReadRing) {
+  SharedTxBusLink link(queue_, cache_);
+  ASSERT_TRUE(link.send_group_packet(0x0A03, {0x00, 0x80, 0x42}));
+  ASSERT_TRUE(link.request_group_read(0x0B04));
+
+  EXPECT_EQ(queue_.size(), 1U);       // the write
+  EXPECT_EQ(queue_.read_size(), 1U);  // the read, in its own ring
+  std::uint16_t addr = 0;
+  Bytes apdu;
+  ASSERT_TRUE(queue_.peek(addr, apdu));
+  EXPECT_EQ(addr, 0x0A03);
+  ASSERT_TRUE(queue_.peek_read(addr));
+  EXPECT_EQ(addr, 0x0B04);
+}
+
+/// Nothing can answer a read while the bus is down, so it is rejected like a
+/// write instead of being queued for later.
+TEST_F(SharedTxBusLinkTest, GroupReadIsRejectedWhileTheBusIsDown) {
+  SharedTxBusLink link(queue_, cache_);
+  cache_.publish_bus_status(false);
+  EXPECT_FALSE(link.request_group_read(0x0B04));
+  EXPECT_EQ(queue_.read_size(), 0U);
+}
+
+TEST_F(SharedTxBusLinkTest, GroupReadFailsWhenTheReadRingIsFull) {
+  SharedTxBusLink link(queue_, cache_);
+  for (std::size_t i = 0; i < kReadQueueCapacity - 1; ++i) {
+    ASSERT_TRUE(link.request_group_read(static_cast<std::uint16_t>(0x1000 + i)));
+  }
+  EXPECT_FALSE(link.request_group_read(0x0B04));
+}
+
+TEST_F(SharedTxBusLinkTest, GroupReadFailsWithoutASharedQueue) {
+  SharedTxQueue uninitialized;
+  SharedTxBusLink link(uninitialized, cache_);
+  EXPECT_FALSE(link.request_group_read(0x0B04));
+}
+
 }  // namespace
 }  // namespace cvknx

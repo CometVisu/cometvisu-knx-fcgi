@@ -246,6 +246,29 @@ actual file content (e.g., `#pragma once` or `#include`).
    `clone3`/`clone` with process-sharing flags (CLONE_VM, CLONE_THREAD) is
    blocked, preventing `std::thread` creation.
 
+   **A worker owns its accepted connection and bounds its lifetime.**
+   `FcgiServer::run()` accepts the connection itself (`poll()` on the listen
+   socket + `accept4()`), hands the fd to libfcgi with
+   `request_.ipcFd`/`keepConnection = 1`, and serves one request after another
+   on it (`FCGX_Accept_r` on the same fd).  A connection that makes no progress
+   — a client that never completes its request, or an idle keep-alive
+   connection — is dropped after `FCGI_CONNECTION_TIMEOUT_SEC` (default 330 s,
+   `SO_RCVTIMEO`/`SO_SNDTIMEO` plus a bounded wait for the next request).  The
+   FastCGI protocol has no keep-alive timeout, so without this bound a single
+   connection occupied a worker until the client closed it (verified: with one
+   worker, a second client was not served while an idle keep-alive connection
+   was open).  `shutdown()` also interrupts the active connection, which makes
+   the stop prompt even when a client is stalled mid-request.
+
+   **libfcgi's own signal handling must be undone.**  `FCGX_Init()` (via
+   `OS_LibInit()`) installs a SIGTERM handler that only reacts while libfcgi
+   itself is blocked in `accept()`, and ignores SIGINT/SIGQUIT.  Since the
+   server accepts on its own, that handler would swallow SIGTERM: a worker
+   would never stop, and would even survive its supervisor because
+   `PR_SET_PDEATHSIG` delivers SIGTERM.  `run()` therefore saves the SIGTERM
+   disposition before `FCGX_Init()` and restores it afterwards (SIG_DFL in
+   production, the coverage flush handler in instrumented builds).
+
 2. **Transports and the single bus owner**: `KNX_TRANSPORT` is **required**
    (`knxd`, `ip-tunnel`, `ip-routing`); there is no default, so a wrong `ip-*`
    setup can never be mistaken for a knxd outage.  Handlers, router and cache
@@ -398,6 +421,14 @@ actual file content (e.g., `#pragma once` or `#include`).
    blocked.  Sizing them to the full pool (as an earlier version did) let a
    handful of readers occupy every worker.
 
+   A token is released when its handler returns, **before** the response is
+   written.  Releasing it at the end of the request cycle (after
+   `FCGX_Finish_r()`) let a sequential client race the previous worker for the
+   capacity — it saw EOF and sent its next `/r` while that worker still held the
+   token — so a pool of two answered a spurious
+   `503 {"error":"all workers busy"}`.  An idle keep-alive connection held the
+   token even longer.
+
    **Every `/r` and `/w` request must carry the protocol's session parameter
    `s`.**  A missing `s` answers `401 {"error":"missing session"}`; the
    anonymous id `"0"` (returned by `/l` without credentials) stays valid.
@@ -469,6 +500,25 @@ actual file content (e.g., `#pragma once` or `#include`).
    buggy one retrying in a loop — therefore cannot flood the bus, however many
    writes it queues; the telegrams stay in the ring (`TxDrain::wait_ms` keeps
    reception running while the interval elapses).
+
+   **`A_GroupValue_Read` requests have their own, lower-priority ring.**  A
+   `t=0` read of a cold cache requests one read per address — in a large
+   CometVisu config that is thousands of telegrams, and they must never queue
+   in front of a switch press.  `BusLink::request_group_read()` is the seam:
+   `SharedTxBusLink` puts the address into `SharedTxQueue`'s read ring (deduped,
+   independent of the 256-slot write ring), and `drain_tx_queue()` drains the
+   write ring first, then at most `kMaxReadBurst` (10) reads per call, paced by
+   the same global interval.  The answers wake every long-poll through the
+   cache like any other telegram.
+
+   **The read ring is sized for a maximal address list**
+   (`kReadQueueCapacity` = 8192, i.e. 8191 requests plus the full/empty mark).
+   A `t=0` client sends its whole list once and never asks for the missing
+   addresses again, so a truncation would leave the tail of the visualization
+   empty forever.  `QueryString::kMaxValuesPerKey` allows 4096 addresses; the
+   second half of the ring takes a second large client.  If several maximal
+   clients nevertheless exhaust it, the handler stops queueing and logs
+   `read ring full: queued N of M` — the loss is never silent.
 
 9. **Bus availability is reported to the client**: the cache reader publishes
    its connection state into the shared memory region

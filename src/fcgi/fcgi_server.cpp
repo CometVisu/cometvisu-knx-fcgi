@@ -28,11 +28,16 @@
 
 #include "fcgi_server.h"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +50,23 @@ namespace cvknx {
 /// Maximum allowed request body size (64 KB).
 /// Prevents OOM from a malicious CONTENT_LENGTH.
 inline constexpr int kMaxContentLength = 64 * 1024;
+
+/// How long a connection may take before the worker drops it.
+///
+/// Covers the two unbounded waits of the FastCGI protocol: a client that never
+/// completes its request (slow/silent peer, a half-open connection) and an idle
+/// keep-alive connection between two requests.  The long-poll itself is bounded
+/// separately (`kMaxClientWaitSec` in read_handler.h, 330 s) and the client
+/// re-creates its request anyway, so 330 s is the natural deadline for the
+/// connection too.
+inline constexpr int kDefaultConnectionTimeoutMs = 330 * 1000;
+
+/// Slice of the idle wait in the accept loop.
+///
+/// The listen socket is poll()ed in short slices instead of a blocking
+/// accept(), so a shutdown request is noticed within one slice even when no
+/// client connects (and no signal interrupts the wait).
+inline constexpr int kAcceptPollSliceMs = 250;
 
 namespace {
 
@@ -85,7 +107,26 @@ private:
 
 }  // namespace
 
-FcgiServer::FcgiServer() = default;
+namespace {
+
+/// Clears the "serving this connection" marker on every exit path of
+/// serve_connection(), so a later shutdown() never touches a stale fd.
+class ConnectionGuard {
+public:
+  explicit ConnectionGuard(std::atomic<int>& active) : active_(active) {}
+  ~ConnectionGuard() { active_.store(-1, std::memory_order_relaxed); }
+  ConnectionGuard(const ConnectionGuard&) = delete;
+  ConnectionGuard& operator=(const ConnectionGuard&) = delete;
+  ConnectionGuard(ConnectionGuard&&) = delete;
+  ConnectionGuard& operator=(ConnectionGuard&&) = delete;
+
+private:
+  std::atomic<int>& active_;
+};
+
+}  // namespace
+
+FcgiServer::FcgiServer() : connection_timeout_ms_(kDefaultConnectionTimeoutMs) {}
 
 FcgiServer::~FcgiServer() {
   shutdown();
@@ -133,6 +174,16 @@ bool FcgiServer::listen(const std::string& socket_path, int backlog) {
   }
   // GCOV_EXCL_STOP
   listen_fd_ = fd;
+
+  // A worker polls the listen fd and only then accepts, so two workers can both
+  // see the same connection: the one that loses the race must wait for the next
+  // client instead of failing with EAGAIN (which would end its loop).  The
+  // blocking mode is also what makes shutdown(listen_fd_) a reliable way to
+  // end a blocked accept().
+  const int flags = ::fcntl(listen_fd_, F_GETFL, 0);
+  if (flags >= 0) {  // GCOV_EXCL_BR_LINE - fcntl() on a fresh fd cannot fail
+    (void)::fcntl(listen_fd_, F_SETFL, flags & ~O_NONBLOCK);
+  }
   return true;
 }
 
@@ -162,6 +213,16 @@ int FcgiServer::run() {
   // FCGX_Init() must be called before FCGX_Accept_r() — it sets the
   // libInitialized flag and performs platform-specific setup (OS_LibInit).
   // FCGX_InitRequest() alone does NOT mark the library as initialized.
+  //
+  // OS_LibInit() also installs libfcgi's own SIGTERM handler (which only
+  // reacts while libfcgi itself is blocked in accept()) and ignores
+  // SIGINT/SIGQUIT.  This server accepts on its own so that the lifetime of a
+  // connection is bounded, which means libfcgi never sees the signal: the
+  // worker would swallow SIGTERM and never stop, and would even survive the
+  // death of its supervisor (PR_SET_PDEATHSIG).  Keep the disposition the
+  // caller (main.cpp / the tests) installed.
+  struct sigaction caller_sigterm {};  // SIG_DFL when retrieval fails
+  (void)::sigaction(SIGTERM, nullptr, &caller_sigterm);
   // GCOV_EXCL_START - FCGX_Init() only fails on internal resource
   // exhaustion; repeated calls return 0 as well (verified), so no test can
   // reach this branch.
@@ -170,33 +231,110 @@ int FcgiServer::run() {
     return 1;
   }
   // GCOV_EXCL_STOP
+  (void)::sigaction(SIGTERM, &caller_sigterm, nullptr);
 
   // GCOV_EXCL_START - see above: FCGX_InitRequest() returns 0 for a valid fd
   // and cannot be made to fail from a test.
-  if (FCGX_InitRequest(&request_, listen_fd_, 0) != 0) {
+  // FCGI_FAIL_ACCEPT_ON_INTR makes a signal (SIGTERM, the shutdown self-connect)
+  // end a blocked accept() instead of silently restarting it.
+  if (FCGX_InitRequest(&request_, listen_fd_, FCGI_FAIL_ACCEPT_ON_INTR) != 0) {
     std::cerr << "[ERROR] FCGX_InitRequest failed\n";
     return 1;
   }
   // GCOV_EXCL_STOP
 
   // Accept FastCGI connections on our own Unix/TCP socket.  Each worker of
-  // the fork-based pool inherits listen_fd_ and calls FCGX_Accept_r()
-  // independently; the kernel serialises the accept calls.
-  while (FCGX_Accept_r(&request_) >= 0) {
-    // Read the request parameters from the FCGI parameter array.  The
-    // spawn-fcgi-era getenv() variant is gone: envp is passed explicitly,
-    // which is thread-safe and avoids mutating the global `environ`.
-    const FcgiRequest req = read_request(request_.envp);
+  // the fork-based pool inherits listen_fd_ and accepts independently; the
+  // kernel serialises the accept calls.  The accept itself is ours (not
+  // libfcgi's) so the connection lifetime is bounded: see serve_connection().
+  while (!shutdown_requested_.load(std::memory_order_relaxed)) {
+    const int conn = accept_connection();
+    if (conn < 0) {
+      break;
+    }
+    serve_connection(conn);
+  }
 
-    // ---- Capacity limiting for long-poll reads only ----
-    // Only /r can hold a worker for hundreds of seconds, so only /r takes a
-    // token.  Writes (/w) and logins (/l) finish in microseconds and must
-    // never be rejected — a spurious 503 here surfaces in CometVisu as a
-    // failed switch operation.
-    //
-    // The tokens are released by their destructors at the end of this
-    // iteration, so every exit path (early `continue`, throwing handler)
-    // returns the capacity.  A leaked token permanently shrinks the pool.
+  return 0;
+}
+
+void FcgiServer::set_connection_timeout_ms(int timeout_ms) {
+  // A non-positive value would make every read time out immediately.
+  connection_timeout_ms_ = std::max(1, timeout_ms);
+}
+
+int FcgiServer::accept_connection() {
+  for (;;) {
+    if (shutdown_requested_.load(std::memory_order_relaxed)) {
+      return -1;
+    }
+    struct pollfd pfd {};
+    pfd.fd = listen_fd_;
+    pfd.events = POLLIN;
+    if (::poll(&pfd, 1, kAcceptPollSliceMs) > 0) {
+      // accept() is blocking (see listen()): a wake-up whose connection another
+      // worker already accepted simply waits for the next one instead of
+      // failing, and shutdown(listen_fd_) ends a blocked accept with EINVAL.
+      return ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+    }
+  }
+}
+
+void FcgiServer::serve_connection(int conn) {
+  // The connection lifetime is ours: libfcgi must not close the fd between two
+  // requests, and it must not wait for one forever either (the socket timeout
+  // below bounds every read and write it performs).
+  request_.ipcFd = conn;
+  request_.keepConnection = 1;
+  active_conn_.store(conn, std::memory_order_relaxed);
+  const ConnectionGuard guard(active_conn_);
+
+  for (;;) {
+    // Re-applied per iteration: libfcgi may have dropped a stalled connection
+    // internally and accepted a fresh one, which has no timeout of its own.
+    set_socket_timeout(request_.ipcFd, connection_timeout_ms_);
+    if (FCGX_Accept_r(&request_) < 0) {
+      // EOF, a stalled request or shutdown.  libfcgi closes the connection on
+      // every one of these paths (ipcFd is -1 afterwards).
+      return;
+    }
+    handle_request();
+    FCGX_Finish_r(&request_);
+    if (request_.ipcFd < 0) {
+      return;  // the client did not ask for keep-alive
+    }
+    // Keep-alive: a client that sends nothing more within the deadline is
+    // dropped and the worker returns to accepting new connections.
+    if (!wait_for_request(request_.ipcFd, connection_timeout_ms_)) {
+      ::close(request_.ipcFd);
+      request_.ipcFd = -1;
+      return;
+    }
+  }
+}
+
+void FcgiServer::handle_request() {
+  // Read the request parameters from the FCGI parameter array.  The
+  // spawn-fcgi-era getenv() variant is gone: envp is passed explicitly,
+  // which is thread-safe and avoids mutating the global `environ`.
+  const FcgiRequest req = read_request(request_.envp);
+
+  // ---- Capacity limiting for long-poll reads only ----
+  // Only /r can hold a worker for hundreds of seconds, so only /r takes a
+  // token.  Writes (/w) and logins (/l) finish in microseconds and must
+  // never be rejected — a spurious 503 here surfaces in CometVisu as a
+  // failed switch operation.
+  //
+  // The tokens are released by their destructors at the end of this block,
+  // i.e. as soon as the handler has returned — *before* the response is
+  // written.  Releasing them after FCGX_Finish_r() closed the connection
+  // made a sequential client race the previous worker for the capacity: it
+  // saw EOF and sent its next /r while that worker still held its token, so
+  // a small pool answered a spurious 503.  Every exit path (early `return`,
+  // throwing handler) still returns the capacity; a leaked token permanently
+  // shrinks the pool.
+  FcgiResponse resp;
+  {
     SemToken concurrency_token;
     SemToken load_shed_token;
     if (req.path() == "/r") {
@@ -207,8 +345,7 @@ int FcgiServer::run() {
           busy_resp.status_code = 503;
           busy_resp.body = R"({"error":"all workers busy"})";
           write_response(busy_resp);
-          FCGX_Finish_r(&request_);
-          continue;
+          return;
         }
         concurrency_token = SemToken(concurrency_sem_);
       }
@@ -222,8 +359,7 @@ int FcgiServer::run() {
           empty_resp.status_code = 503;
           empty_resp.body = R"({"error":"too many long-poll requests"})";
           write_response(empty_resp);
-          FCGX_Finish_r(&request_);
-          continue;
+          return;
         }
         load_shed_token = SemToken(load_shed_sem_);
       }
@@ -231,20 +367,48 @@ int FcgiServer::run() {
 
     DebugLog::http_request(req.request_method, req.request_uri);
 
-    const FcgiResponse resp = invoke_handler(req);
-
-    DebugLog::http_response(resp.status_code, resp.body);
-
-    write_response(resp);
-
-    FCGX_Finish_r(&request_);
+    resp = invoke_handler(req);
   }
 
-  return 0;
+  DebugLog::http_response(resp.status_code, resp.body);
+
+  write_response(resp);
+}
+
+void FcgiServer::set_socket_timeout(int fd, int timeout_ms) {
+  struct timeval tv {};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+  // GCOV_EXCL_START - only fails on an invalid fd, which the caller owns
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  // GCOV_EXCL_STOP
+}
+
+bool FcgiServer::wait_for_request(int fd, int timeout_ms) {
+  struct pollfd pfd {};
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  const int rc = ::poll(&pfd, 1, timeout_ms);
+  if (rc <= 0) {
+    return false;  // timeout, or a signal during the wait (EINTR)
+  }
+  // POLLIN first: a client that sent a request and then closed its write side
+  // still gets that request served.
+  return (pfd.revents & POLLIN) != 0;
 }
 
 void FcgiServer::shutdown() {
   shutdown_requested_.store(true, std::memory_order_relaxed);
+
+  // A worker that is blocked reading a request (a stalled/slow client) or
+  // waiting for the next request on an idle keep-alive connection would
+  // otherwise ignore the shutdown for up to FCGI_CONNECTION_TIMEOUT_SEC.
+  // shutdown(2) is async-signal-safe, like the rest of this method.
+  const int conn = active_conn_.load(std::memory_order_relaxed);
+  if (conn >= 0) {
+    ::shutdown(conn, SHUT_RDWR);
+  }
 
   if (listen_fd_ >= 0) {
     // Three-step shutdown to reliably unblock workers stuck in accept():

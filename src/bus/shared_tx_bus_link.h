@@ -51,6 +51,12 @@ public:
   [[nodiscard]] bool send_group_packet(std::uint16_t group_addr,
                                        const std::vector<std::uint8_t>& apdu) override;
 
+  /// Queue an `A_GroupValue_Read` in the low-priority read ring.
+  ///
+  /// The cache reader sends it only when no write is waiting, so a `t=0`
+  /// cold-cache refresh cannot occupy the ring ahead of a switch press.
+  [[nodiscard]] bool request_group_read(std::uint16_t group_addr) override;
+
   [[nodiscard]] bool poll_group_telegram(std::uint16_t& out_group_addr,
                                          std::vector<std::uint8_t>& out_apdu) override;
   [[nodiscard]] int get_fd() const override { return -1; }

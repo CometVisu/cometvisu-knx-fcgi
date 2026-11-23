@@ -97,12 +97,24 @@ namespace detail {
 /// backlog.  Eight telegrams per batch keeps both latencies bounded.
 inline constexpr int kMaxTxBatch = 8;
 
+/// Maximum `A_GroupValue_Read` requests per drain call.
+///
+/// A `t=0` refresh of a large address list must not be pushed onto the bus as
+/// one burst: ten requests at a time (further paced by the global send rate)
+/// give the devices time to answer, and the answers wake the client's long-poll
+/// through the cache.
+inline constexpr int kMaxReadBurst = 10;
+
 /// Send waiting telegrams into the bus.
 ///
 /// Clears the eventfd first, so a push during draining re-arms it.  Telegrams
 /// are paced by @p interval_ms; the pacing is expressed as a wait *after* the
 /// batch, never as a sleep inside the loop, so an inbound telegram is still
 /// delivered immediately (AGENTS.md rule 2).
+///
+/// Writes are drained first: a queued write always overtakes a queued read, so
+/// a cold-cache refresh cannot delay a switch press.  Reads follow in a bounded
+/// burst.
 ///
 /// @param stop_requested Checked between telegrams, so shutdown stays prompt.
 /// @param next_send_at Earliest time the next telegram may go out (state of
@@ -137,6 +149,38 @@ TxDrain drain_tx_queue(BusLink& link, SharedTxQueue& queue,
     next_send_at = std::chrono::steady_clock::now() + interval;
     DebugLog::knxd_send("tx_queue", KnxGroupAddress::from_eibaddr(addr).to_string(),
                         hex_encode(apdu.data(), apdu.size()));
+  }
+
+  // ---- Queued group reads (never before a write) ----
+  // A pacing wait or a failed send ends the batch: both apply to the bus as a
+  // whole, not to one kind of telegram.
+  if (result.wait_ms == 0 && !result.failed) {
+    const std::vector<uint8_t> read_apdu{0x00, 0x00};  // A_GroupValue_Read
+    uint16_t read_addr = 0;
+    while (result.reads < kMaxReadBurst && !stop_requested(should_stop) &&
+           queue.peek_read(read_addr)) {
+      if (interval.count() > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_send_at) {
+          result.wait_ms = static_cast<int>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(next_send_at - now).count() +
+              1);
+          break;
+        }
+      }
+      if (!link.send_group_packet(read_addr, read_apdu)) {
+        // The request stays queued; it is retried after the reconnect.
+        DebugLog::log(DebugLog::Level::Warn, "failed to send queued group read to " + link.label());
+        result.failed = true;
+        break;
+      }
+      queue.pop_read_drop();
+      ++result.sent;
+      ++result.reads;
+      next_send_at = std::chrono::steady_clock::now() + interval;
+      DebugLog::knxd_send("group_read", KnxGroupAddress::from_eibaddr(read_addr).to_string(),
+                          "apdu=0000");
+    }
   }
   return result;
 }
@@ -298,7 +342,7 @@ void run_cache_reader(BusLink& link, SharedGroupCache& cache, SharedTxQueue* tx_
       pace_wait_ms = drained.wait_ms;
       // A failing link must not turn the backlog into a busy loop: fall through
       // to a normal (sleeping) wait and retry after it.
-      backlog = (tx_queue->size() > 0) && !send_failed;
+      backlog = (tx_queue->size() > 0 || tx_queue->read_size() > 0) && !send_failed;
     }
     if (sent > 0 && !backlog) {
       continue;

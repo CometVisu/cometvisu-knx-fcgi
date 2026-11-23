@@ -172,5 +172,119 @@ TEST(SharedTxQueueTest, ATornLengthIsClampedWhenDequeued) {
   EXPECT_EQ(apdu.size(), kMaxTxValueBytes);
 }
 
+// ================================================================
+// Pending group reads (`t=0`) live in their own, lower-priority ring
+// ================================================================
+
+TEST(SharedTxQueueTest, ReadRequestsUseTheirOwnRing) {
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  ASSERT_TRUE(queue.push(0x0A03, {0x00, 0x80, 0x42}));
+  ASSERT_TRUE(queue.push_read(0x0A04));
+  EXPECT_EQ(queue.size(), 1U);
+  EXPECT_EQ(queue.read_size(), 1U);
+
+  std::uint16_t addr = 0;
+  Bytes apdu;
+  ASSERT_TRUE(queue.peek(addr, apdu));
+  EXPECT_EQ(addr, 0x0A03);
+  ASSERT_TRUE(queue.peek_read(addr));
+  EXPECT_EQ(addr, 0x0A04);
+
+  // Removing a write must not touch the read ring, and vice versa.
+  queue.pop_drop();
+  EXPECT_EQ(queue.size(), 0U);
+  EXPECT_EQ(queue.read_size(), 1U);
+  queue.pop_read_drop();
+  EXPECT_EQ(queue.read_size(), 0U);
+  queue.pop_read_drop();  // popping an empty ring is a no-op
+  EXPECT_EQ(queue.read_size(), 0U);
+}
+
+TEST(SharedTxQueueTest, APendingReadIsNotQueuedTwice) {
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  EXPECT_TRUE(queue.push_read(0x0A03));
+  EXPECT_TRUE(queue.push_read(0x0A03));  // already in flight
+  EXPECT_EQ(queue.read_size(), 1U);
+  EXPECT_TRUE(queue.push_read(0x0B04));
+  EXPECT_EQ(queue.read_size(), 2U);
+}
+
+TEST(SharedTxQueueTest, ReadRingIsBoundedIndependently) {
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  const auto base = static_cast<std::uint16_t>(0x1000);
+  for (std::size_t i = 0; i < kReadQueueCapacity - 1; ++i) {
+    ASSERT_TRUE(queue.push_read(static_cast<std::uint16_t>(base + i)));
+  }
+  EXPECT_EQ(queue.read_size(), kReadQueueCapacity - 1);
+  EXPECT_FALSE(queue.push_read(0x0A03));  // full
+  // The write ring is unaffected by a full read ring.
+  EXPECT_TRUE(queue.push(0x0A03, {0x00, 0x80, 0x42}));
+}
+
+/// A cold-cache client may ask for up to 4096 addresses in one `a` parameter
+/// (`QueryString::kMaxValuesPerKey`) and sends `t=0` only once — so the whole
+/// list must fit, or the tail of the visualization stays empty forever.
+TEST(SharedTxQueueTest, AMaximalAddressListFitsInTheReadRing) {
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  constexpr std::size_t kMaxAddressesPerRequest = 4096;
+  for (std::size_t i = 0; i < kMaxAddressesPerRequest; ++i) {
+    ASSERT_TRUE(queue.push_read(static_cast<std::uint16_t>(0x1000 + i)))
+        << "address " << i << " of a maximal request was rejected";
+  }
+  EXPECT_EQ(queue.read_size(), kMaxAddressesPerRequest);
+}
+
+TEST(SharedTxQueueTest, ReadRequestsAreSharedAcrossAttachedInstances) {
+  SharedTxQueue writer;
+  ASSERT_TRUE(writer.create());
+  SharedTxQueue reader;
+  reader.attach(writer.data());
+
+  ASSERT_TRUE(writer.push_read(0x0A03));
+  EXPECT_EQ(reader.read_size(), 1U);
+  std::uint16_t addr = 0;
+  ASSERT_TRUE(reader.peek_read(addr));
+  EXPECT_EQ(addr, 0x0A03);
+  reader.pop_read_drop();
+  EXPECT_EQ(writer.read_size(), 0U);
+}
+
+/// The read ring wraps like any ring: the count must stay correct once the
+/// write index has wrapped past the end.
+TEST(SharedTxQueueTest, ReadRingWrapsAroundTheEnd) {
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  ASSERT_TRUE(queue.push_read(0x0A03));
+  queue.pop_read_drop();  // head = 1
+  for (std::size_t i = 0; i < kReadQueueCapacity - 1; ++i) {
+    ASSERT_TRUE(queue.push_read(static_cast<std::uint16_t>(0x1000 + i)));
+  }
+  // tail wrapped to 0, head is 1: the count is the wrapped distance.
+  EXPECT_EQ(queue.read_size(), kReadQueueCapacity - 1);
+  std::uint16_t addr = 0;
+  ASSERT_TRUE(queue.peek_read(addr));
+  EXPECT_EQ(addr, 0x1000);  // FIFO order survives the wrap
+}
+
+/// An uninitialized ring reports "nothing" instead of crashing; this is the
+/// process that was handed a queue whose creation failed.
+TEST(SharedTxQueueTest, UninitializedReadRingIsEmpty) {
+  SharedTxQueue queue;
+  EXPECT_FALSE(queue.push_read(0x0A03));
+  std::uint16_t addr = 0;
+  EXPECT_FALSE(queue.peek_read(addr));
+  EXPECT_EQ(queue.read_size(), 0U);
+  queue.pop_read_drop();  // no-op
+}
+
 }  // namespace
 }  // namespace cvknx

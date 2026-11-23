@@ -1008,8 +1008,53 @@ TEST_F(ReadHandlerTest, TZeroOnlyReadsUncachedAddresses) {
   EXPECT_EQ(sent[0].apdu[1], 0x00);
 }
 
-/// A full TX ring (or a missing bus) must stop the t=0 read storm at the first
-/// rejected telegram instead of hammering a queue that cannot accept them.
+/// t=0 must issue its bus reads through BusLink::request_group_read(): that is
+/// the seam a worker implements by queueing them in the low-priority read ring
+/// (so they can never overtake a write).  A handler that called
+/// send_group_packet() directly would bypass the ring.
+TEST_F(ReadHandlerTest, TZeroUsesTheGroupReadSeam) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_EQ(knxd_.read_request_calls(), 2);
+}
+
+/// A real CometVisu config subscribes hundreds of addresses, and the client
+/// sends `t=0` only once — so every one of them must get a bus read.  (The
+/// shared read ring is sized for a maximal list of 4096; nothing may be
+/// truncated at some smaller queue size.)
+TEST_F(ReadHandlerTest, TZeroQueuesEveryAddressOfALargeConfig) {
+  constexpr int kCount = 400;
+  std::string query = "s=0&t=0";
+  for (int i = 0; i < kCount; ++i) {
+    query += "&a=0/" + std::to_string(i / 256) + "/" + std::to_string(i % 256);
+  }
+
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle(query);
+
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_EQ(knxd_.read_request_calls(), kCount) << "an address list must never be truncated";
+}
+
+/// If the ring really is full (several huge clients at once), the addresses that
+/// were not queued are reported — silently skipping them would leave the tail of
+/// a visualization empty forever, because nothing asks for them again.
+TEST_F(ReadHandlerTest, AFullReadRingIsReported) {
+  knxd_.set_read_request_fail_count(1);  // the very first request is rejected
+
+  ReadHandler handler(cache_, knxd_, sessions_);
+  ::testing::internal::CaptureStderr();
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&a=1/4/5&t=0");
+  const std::string logged = ::testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(r.http_status, 200) << "the response still carries the cached values";
+  EXPECT_EQ(knxd_.read_request_calls(), 1) << "the loop stops at the first rejection";
+  EXPECT_NE(logged.find("read ring full: queued 0 of 3"), std::string::npos) << logged;
+}
+
+/// A full TX ring (or a missing bus) must stop the t=0 read storm at the first/// rejected telegram
+/// instead of hammering a queue that cannot accept them.
 TEST_F(ReadHandlerTest, TZeroStopsGeneratingReadsWhenTheBusRejectsThem) {
   knxd_.set_send_fail_count(1);
 

@@ -42,6 +42,7 @@
 #include "knxd/knxd_protocol.h"
 #include "state/session_store.h"
 #include "state/shared_group_cache.h"
+#include "util/debug_log.h"
 #include "util/hex.h"
 #include "util/json_builder.h"
 #include "util/query_string.h"
@@ -220,20 +221,33 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   // issue a GroupValueRead telegram.  The response arrives asynchronously and is
   // handled like a normal bus write by the cache reader process.  The response
   // to THIS request is returned immediately (non-blocking).
+  //
+  // The requests go into the shared read ring, which the cache reader drains
+  // only after every queued write and at the global send rate: a cold-cache
+  // refresh over a large address list therefore cannot occupy the bus (or the
+  // TX ring) ahead of a switch press.  The ring is sized for a maximal address
+  // list, so a rejection means several huge clients hit the bus at once — that
+  // must not be silent: nothing would ask for the dropped addresses again
+  // (a client sends `t=0` only once), and their tiles would stay empty forever.
   if (t_provided && t_original == 0) {
-    // Build GroupValueRead APDU: [0x00, 0x00] = A_GroupValue_Read
-    const std::vector<uint8_t> read_apdu = {0x00, 0x00};
+    const auto uncached = static_cast<std::size_t>(std::count_if(
+        eib_addrs.begin(), eib_addrs.end(),
+        [&already_written](uint16_t addr) { return !already_written.contains(addr); }));
+    std::size_t queued = 0;
     for (auto addr : eib_addrs) {
       if (already_written.contains(addr)) {
         continue;
       }
-      if (!knxd_.send_group_packet(addr, read_apdu)) {
-        // The bus is unreachable or the shared TX ring is full.  Generating
-        // more telegrams would only hammer a queue that cannot accept them;
-        // these bus reads are best effort (the answer already carries the
-        // cached values), so stop here instead of flooding the ring.
+      if (!knxd_.request_group_read(addr)) {
         break;
       }
+      ++queued;
+    }
+    if (queued < uncached) {
+      DebugLog::log(DebugLog::Level::Warn,
+                    "read ring full: queued " + std::to_string(queued) + " of " +
+                        std::to_string(uncached) +
+                        " A_GroupValue_Read requests — the rest stay unread");
     }
   }
 
