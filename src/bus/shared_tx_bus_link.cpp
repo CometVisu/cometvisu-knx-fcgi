@@ -43,6 +43,22 @@ bool SharedTxBusLink::send_group_packet(std::uint16_t group_addr,
   return true;
 }
 
+bool SharedTxBusLink::request_group_read(std::uint16_t group_addr) {
+  if (!queue_.is_initialized()) {
+    return false;
+  }
+  // Nothing can answer while the reader has no bus connection; queueing would
+  // only delay the answer past the client's patience.
+  if (!cache_.bus_status().available) {
+    return false;
+  }
+  if (!queue_.push_read(group_addr)) {
+    return false;  // read ring full
+  }
+  queue_.signal();
+  return true;
+}
+
 bool SharedTxBusLink::poll_group_telegram(std::uint16_t& out_group_addr,
                                           std::vector<std::uint8_t>& out_apdu) {
   // Workers never receive telegrams: the cache reader owns the bus connection

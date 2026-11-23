@@ -70,7 +70,7 @@ and ignored.
 
 ### Sessions
 
-* `/l` returns `{"v":"0.0.2","s":"<id>"}`.  Without `u` and `p` the id is the
+* `/l` returns `{"v":"0.0.3","s":"<id>"}`.  Without `u` and `p` the id is the
   anonymous session `"0"`.  A normal build also adds a `"c"` object with
   `fcgiVersion`, `fcgiGitHash` and — when configured — `baseURL`,
   `knxdBuildVersion`, `knxdBuildGitHash` and the raw members of
@@ -109,7 +109,10 @@ and ignored.
   possibly empty `d`; the client simply repeats the request.
 * `t=0`: answer with the cached snapshot and send `A_GroupValue_Read` for every
   address without a value.  The request waits at most about one second for the
-  answers; a value that arrives later is delivered by the next read.
+  answers; a value that arrives later is delivered by the next read.  The reads
+  are queued (up to the protocol maximum of 4096 addresses) in a lower-priority
+  ring and sent in small bursts after every pending write, so a large cold-cache
+  refresh never delays a switch press.
 * `t>0`: values must be at most `t` seconds old; the request then polls for up
   to `t` seconds for newer values.  `t` is capped at 330 s.
 * `t<0`: cache only — no bus read, no age filter, immediate answer.
@@ -282,6 +285,7 @@ does that for you.
 | `FCGI_SOCKET`         | *(required)* | FCGI listen socket: `:port` or `host:port` for TCP, or a filesystem path for a Unix socket. The backend opens it itself; a Unix socket is created with mode `0660`. A TCP socket has no authentication or peer check — `:port` listens on all interfaces, so bind a loopback address (`127.0.0.1:9000`) or keep the port behind a firewall. |
 | `FCGI_WORKERS`        | `20`       | Number of pre-forked worker processes (1–256). Each worker serves one request at a time; an idle worker costs a few MB of RAM. Workers never open a bus connection of their own — they enqueue writes into the shared TX queue. Two workers are kept free for `/w` and `/l`, so at most `max(1, FCGI_WORKERS - 2)` long-polls are served at the same time. |
 | `LONGPOLL_TIMEOUT_SEC`| `300`      | Max seconds to wait in long-poll `/r` (1–330).  A client supplied `t` is capped at the same value. |
+| `FCGI_CONNECTION_TIMEOUT_SEC` | `330` | Max seconds a FastCGI connection may spend without progress before the worker drops it (1–330).  Covers a client that never finishes its request and an idle keep-alive connection: the FastCGI protocol has no keep-alive timeout, so without this bound one connection could occupy a worker forever.  A client that is cut off simply opens a new connection; the long-poll itself is bounded by `LONGPOLL_TIMEOUT_SEC` anyway. |
 | `KNX_TX_MAX_PER_SEC`  | `10`       | Hard upper bound on outgoing telegrams per second over **all** clients and workers (1–1000). The cache reader is the only process that sends, so this limit cannot be bypassed by a client — or by a buggy one — and it protects the bus from flooding. |
 | `BASE_URL`            | *(unset)*  | When set, the login (`/l`) response includes a config object `"c"` with `"baseURL"` set to this value. Used by the web server to advertise the URL prefix under which the backend is reachable (e.g. `/proxy/visu`). |
 | `SESSION_TTL_SEC`     | `1800`     | Lifetime of a session in seconds (1–604800). Sessions are independent of the request wait limit. |
@@ -302,6 +306,7 @@ important limits to stdout (`--help` lists every environment variable):
 [INFO]   FCGI_SOCKET           /run/cometvisu-fcgi.sock
 [INFO]   FCGI_WORKERS          20
 [INFO]   LONGPOLL_TIMEOUT_SEC  300
+[INFO]   FCGI_CONNECTION_TIMEOUT_SEC 330
 [INFO]   KNX_TX_MAX_PER_SEC    10
 [INFO]   ADDRESS_PREFIX        (not set)
 [INFO]   BASE_URL              (not set)

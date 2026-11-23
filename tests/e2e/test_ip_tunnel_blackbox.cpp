@@ -217,7 +217,7 @@ protected:
 TEST_F(IpTunnelBlackBox, LoginAnswersTheCometVisuProtocolVersion) {
   const auto response = cvknx::blackbox::fcgi_request(backend_->socket_path(), "/l", "POST");
   EXPECT_EQ(response.status, 200) << backend_->log();
-  EXPECT_NE(response.body.find("\"v\":\"0.0.2\""), std::string::npos) << response.body;
+  EXPECT_NE(response.body.find("\"v\":\"0.0.3\""), std::string::npos) << response.body;
   EXPECT_NE(response.body.find("\"s\":\"0\""), std::string::npos) << response.body;
 }
 

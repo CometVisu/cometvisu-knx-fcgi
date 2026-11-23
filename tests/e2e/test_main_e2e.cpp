@@ -390,7 +390,8 @@ std::string FcgiGet(const std::string& socket_path, const std::string& endpoint)
 
 /// Open a connection and send one request without waiting for the response.
 /// Returns the socket (caller closes) or -1.
-int SendRequestAsync(const std::string& socket_path, const std::string& endpoint) {
+int SendRequestAsync(const std::string& socket_path, const std::string& endpoint,
+                     bool keep_conn = false) {
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
@@ -418,8 +419,21 @@ int SendRequestAsync(const std::string& socket_path, const std::string& endpoint
     return std::string{static_cast<char>(name.size()), static_cast<char>(value.size())} + name +
            value;
   };
-  std::string request = record(0x01, std::string("\x00\x01\x00\x00\x00\x00\x00\x00", 8));
-  request += record(0x04, param("REQUEST_METHOD", "GET") + param("REQUEST_URI", endpoint));
+  // BEGIN_REQUEST: role FCGI_RESPONDER (1), flags FCGI_KEEP_CONN (1) or 0.
+  std::string begin{'\x00', '\x01', static_cast<char>(keep_conn ? 0x01 : 0x00),
+                    '\x00', '\x00', '\x00',
+                    '\x00', '\x00'};
+  std::string request = record(0x01, begin);
+  // Split "path?query" the way a web server would.  The handlers read the
+  // QUERY_STRING parameter, so a request that only carries REQUEST_URI looks
+  // like a call without parameters — `/r` would answer 401 "missing session"
+  // at once instead of becoming the long-poll this helper is used for.
+  const auto question = endpoint.find('?');
+  const std::string path = endpoint.substr(0, question);
+  const std::string query =
+      question == std::string::npos ? std::string{} : endpoint.substr(question + 1);
+  request += record(0x04, param("REQUEST_METHOD", "GET") + param("REQUEST_URI", endpoint) +
+                              param("PATH_INFO", path) + param("QUERY_STRING", query));
   request += record(0x04, "");
   request += record(0x05, "");
   size_t sent = 0;
@@ -430,6 +444,23 @@ int SendRequestAsync(const std::string& socket_path, const std::string& endpoint
       break;
     }
     sent += static_cast<size_t>(written);
+  }
+  return fd;
+}
+
+/// Open a connection to the backend and send nothing at all.
+int ConnectOnly(const std::string& socket_path) {
+  const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  struct sockaddr_un addr {};
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+  if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return -1;
   }
   return fd;
 }
@@ -761,9 +792,68 @@ TEST(MainE2ETest, WorkerKilledDuringALongPollReturnsItsTokens) {
   EXPECT_TRUE(process.wait_for_output("Restarted worker 0 pid=")) << process.output();
   ::close(client);
 
-  // The pool is usable again: a read is served instead of being rejected.
+  // Both tokens are back in the pool: with one worker (one token) the next
+  // read would be shed as "all workers busy" if the supervisor had not
+  // restored the capacity the killed long-poll was holding.
+  const std::string response = FcgiGet(path, "/r?a=1/2/3&t=-1&s=0");
+  EXPECT_NE(response.find("Status: 200"), std::string::npos) << response;
+  EXPECT_EQ(process.terminate(), 0);
+  ::unlink(path.c_str());
+}
+
+/// A client that connects and never sends a request must not park the worker.
+///
+/// The FastCGI protocol has no read timeout and one connection occupies a
+/// worker until it is closed, so `FCGI_CONNECTION_TIMEOUT_SEC` bounds it.
+/// Without that deadline a single silent client made a one-worker pool
+/// unresponsive forever.
+TEST(MainE2ETest, StalledConnectionDoesNotParkTheWorker) {
+  const std::string path = TempSocketPath("stalled");
+  Env env = RoutingEnv();
+  env.emplace_back("FCGI_SOCKET", path);
+  env.emplace_back("FCGI_WORKERS", "1");
+  env.emplace_back("FCGI_CONNECTION_TIMEOUT_SEC", "1");
+
+  BackendProcess process({}, env);
+  ASSERT_TRUE(process.wait_for_output("All 1 workers started, supervising children..."))
+      << process.output();
+  EXPECT_NE(process.output().find("FCGI_CONNECTION_TIMEOUT_SEC 1"), std::string::npos)
+      << process.output();
+
+  const int stalled = ConnectOnly(path);
+  ASSERT_GE(stalled, 0);
+
+  // The only worker is released when the deadline expires.
   const std::string response = FcgiGet(path, "/l");
   EXPECT_NE(response.find("Status: 200"), std::string::npos) << response;
+
+  ::close(stalled);
+  EXPECT_EQ(process.terminate(), 0);
+  ::unlink(path.c_str());
+}
+
+/// The same bound for an idle keep-alive connection: after its response the
+/// client sends nothing more, and the worker must not stay parked on it.
+TEST(MainE2ETest, IdleKeepAliveConnectionDoesNotParkTheWorker) {
+  const std::string path = TempSocketPath("keepalive");
+  Env env = RoutingEnv();
+  env.emplace_back("FCGI_SOCKET", path);
+  env.emplace_back("FCGI_WORKERS", "1");
+  env.emplace_back("FCGI_CONNECTION_TIMEOUT_SEC", "1");
+
+  BackendProcess process({}, env);
+  ASSERT_TRUE(process.wait_for_output("All 1 workers started, supervising children..."))
+      << process.output();
+
+  const int idle = SendRequestAsync(path, "/l", /*keep_conn=*/true);
+  ASSERT_GE(idle, 0);
+  // Let the worker answer and return to waiting for the next request.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  const std::string response = FcgiGet(path, "/l");
+  EXPECT_NE(response.find("Status: 200"), std::string::npos) << response;
+
+  ::close(idle);
   EXPECT_EQ(process.terminate(), 0);
   ::unlink(path.c_str());
 }

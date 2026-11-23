@@ -225,6 +225,83 @@ TEST(CacheReaderTest, DrainsTxQueueBeforePolling) {
   EXPECT_EQ(tx.size(), 0U);
 }
 
+/// A queued `t=0` read is sent by the loop itself (not only by a direct
+/// drain_tx_queue() call): the read ring counts as backlog, so the loop keeps
+/// polling without waiting a full slice.
+TEST(CacheReaderTest, QueuedReadIsSentByTheLoop) {
+  MockBusLink knxd;
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue tx;
+  ASSERT_TRUE(tx.create());
+  ASSERT_TRUE(tx.push_read(0x0B04));
+
+  CacheReaderOptions options = FastOptions();
+  options.wait_timeout_ms = 5000;  // only the queued read can end the wait quickly
+
+  const auto start = Clock::now();
+  run_cache_reader(knxd, cache, &tx, options, [&knxd] { return !knxd.sent_packets().empty(); });
+  const int64_t elapsed = ElapsedMs(start);
+
+  EXPECT_LT(elapsed, 1000) << "a queued read must not wait for the next poll slice";
+  ASSERT_EQ(knxd.sent_packets().size(), 1U);
+  EXPECT_EQ(knxd.sent_packets()[0].group_addr, 0x0B04);
+  EXPECT_EQ(knxd.sent_packets()[0].apdu, (std::vector<std::uint8_t>{0x00, 0x00}));
+  EXPECT_EQ(tx.read_size(), 0U);
+}
+
+/// A cold-cache client that subscribes hundreds of addresses gets every one of
+/// them: the ring keeps the whole list, and the reader drains it in bursts.
+TEST(CacheReaderReads, AWholeAddressListIsDrainedInBursts) {
+  MockBusLink link;
+  ASSERT_TRUE(link.connect());
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  constexpr std::uint16_t kCount = 400;
+  for (std::uint16_t i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(queue.push_read(static_cast<std::uint16_t>(0x1000 + i)));
+  }
+
+  CacheReaderOptions options = FastOptions();
+  options.wait_timeout_ms = 5000;  // only the read backlog can end the wait
+
+  run_cache_reader(link, cache, &queue, options, [&queue] { return queue.read_size() == 0; });
+
+  ASSERT_EQ(link.sent_packets().size(), kCount) << "no address may be dropped";
+  for (std::uint16_t i = 0; i < kCount; ++i) {
+    EXPECT_EQ(link.sent_packets()[i].group_addr, static_cast<std::uint16_t>(0x1000 + i));
+    EXPECT_EQ(link.sent_packets()[i].apdu, (std::vector<std::uint8_t>{0x00, 0x00}));
+  }
+  EXPECT_EQ(queue.read_size(), 0U);
+}
+
+/// A read backlog keeps the loop polling without a full wait: the burst leaves
+/// requests queued, and those must not wait for the next timer slice.
+TEST(CacheReaderTest, ReadBacklogKeepsTheLoopGoing) {
+  MockBusLink knxd;
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue tx;
+  ASSERT_TRUE(tx.create());
+  for (std::uint16_t i = 0; i < 20; ++i) {
+    ASSERT_TRUE(tx.push_read(static_cast<std::uint16_t>(0x0B00 + i)));
+  }
+
+  CacheReaderOptions options = FastOptions();
+  options.wait_timeout_ms = 5000;  // only the read backlog can end the wait
+
+  const auto start = Clock::now();
+  run_cache_reader(knxd, cache, &tx, options, [&knxd] { return knxd.sent_packets().size() >= 10; });
+  const int64_t elapsed = ElapsedMs(start);
+
+  EXPECT_LT(elapsed, 1000);
+  EXPECT_EQ(knxd.sent_packets().size(), 10U) << "one burst per drain call";
+  EXPECT_EQ(tx.read_size(), 10U) << "the rest stays queued";
+}
+
 TEST(CacheReaderTest, TxQueueDrainedWhenLinkIdle) {
   MockBusLink knxd;
   SharedGroupCache cache;
@@ -516,6 +593,96 @@ TEST(CacheReaderPacing, BatchSizeBoundsOneDrainCall) {
   const auto drained = detail::drain_tx_queue(link, queue, {}, 2, 0, next_send_at);
   EXPECT_EQ(drained.sent, 2);
   EXPECT_EQ(queue.size(), 3U);
+}
+
+// ===========================================================================
+// Queued group reads (t=0): sent after writes, in little bursts
+// ===========================================================================
+
+/// A write always overtakes a queued `t=0` read: a cold-cache refresh must not
+/// delay a switch press.
+TEST(CacheReaderReads, WritesAreSentBeforeQueuedReads) {
+  MockBusLink link;
+  ASSERT_TRUE(link.connect());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+  ASSERT_TRUE(queue.push(0x0A01, {0x00, 0x80, 0x42}));
+  ASSERT_TRUE(queue.push_read(0x0B01));
+  ASSERT_TRUE(queue.push_read(0x0B02));
+
+  auto next_send_at = Clock::time_point{};
+  const auto drained = detail::drain_tx_queue(link, queue, {}, 8, 0, next_send_at);
+  EXPECT_EQ(drained.sent, 3);
+  EXPECT_EQ(drained.reads, 2);
+
+  const auto& sent = link.sent_packets();
+  ASSERT_EQ(sent.size(), 3U);
+  EXPECT_EQ(sent[0].group_addr, 0x0A01) << "the write goes first";
+  EXPECT_EQ(sent[0].apdu, (std::vector<std::uint8_t>{0x00, 0x80, 0x42}));
+  EXPECT_EQ(sent[1].group_addr, 0x0B01);
+  EXPECT_EQ(sent[1].apdu, (std::vector<std::uint8_t>{0x00, 0x00})) << "A_GroupValue_Read";
+  EXPECT_EQ(sent[2].group_addr, 0x0B02);
+  EXPECT_EQ(queue.size(), 0U);
+  EXPECT_EQ(queue.read_size(), 0U);
+}
+
+/// The backlog of reads is drained in bursts, not pushed onto the bus in one
+/// go: ten requests per call leave the rest queued for the next one.
+TEST(CacheReaderReads, ReadsAreSentInBoundedBursts) {
+  MockBusLink link;
+  ASSERT_TRUE(link.connect());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+  for (std::uint16_t i = 0; i < 20; ++i) {
+    ASSERT_TRUE(queue.push_read(static_cast<std::uint16_t>(0x0B00 + i)));
+  }
+  auto next_send_at = Clock::time_point{};
+  const auto drained = detail::drain_tx_queue(link, queue, {}, 64, 0, next_send_at);
+  EXPECT_EQ(drained.reads, 10);
+  EXPECT_EQ(queue.read_size(), 10U) << "the rest waits for the next burst";
+
+  const auto rest = detail::drain_tx_queue(link, queue, {}, 64, 0, next_send_at);
+  EXPECT_EQ(rest.reads, 10);
+  EXPECT_EQ(queue.read_size(), 0U);
+}
+
+/// A read is paced like any other telegram and stays queued while the interval
+/// has not elapsed (it must never be sent twice or lost).
+TEST(CacheReaderReads, ReadsArePacedAndStayQueued) {
+  MockBusLink link;
+  ASSERT_TRUE(link.connect());
+  link.set_min_send_interval_ms(50);
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+  ASSERT_TRUE(queue.push_read(0x0B01));
+  ASSERT_TRUE(queue.push_read(0x0B02));
+
+  auto next_send_at = Clock::time_point{};
+  const auto first = detail::drain_tx_queue(link, queue, {}, 8, 50, next_send_at);
+  EXPECT_EQ(first.reads, 1);
+  EXPECT_EQ(queue.read_size(), 1U);
+
+  const auto second = detail::drain_tx_queue(link, queue, {}, 8, 50, next_send_at);
+  EXPECT_EQ(second.reads, 0);
+  EXPECT_GT(second.wait_ms, 0);
+  EXPECT_EQ(queue.read_size(), 1U);
+}
+
+/// A failed send stops the burst and leaves the read queued for after the
+/// reconnect.
+TEST(CacheReaderReads, FailedReadStaysQueued) {
+  MockBusLink link;
+  ASSERT_TRUE(link.connect());
+  link.set_send_fail_count(1);
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+  ASSERT_TRUE(queue.push_read(0x0B01));
+
+  auto next_send_at = Clock::time_point{};
+  const auto drained = detail::drain_tx_queue(link, queue, {}, 8, 0, next_send_at);
+  EXPECT_EQ(drained.reads, 0);
+  EXPECT_TRUE(drained.failed);
+  EXPECT_EQ(queue.read_size(), 1U);
 }
 
 TEST(CacheReaderPacing, FailedSendLeavesTheTelegramQueued) {

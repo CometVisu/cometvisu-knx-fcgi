@@ -35,7 +35,7 @@ namespace cvknx {
 
 /// CometVisu protocol version reported in the login response "v" field.
 /// This is the wire-protocol version, not the software version.
-static constexpr std::string_view kProtocolVersion = "0.0.2";
+static constexpr std::string_view kProtocolVersion = "0.0.3";
 
 LoginHandler::LoginHandler(SessionStore& sessions, std::string base_url)
     : sessions_(sessions), base_url_(std::move(base_url)) {}

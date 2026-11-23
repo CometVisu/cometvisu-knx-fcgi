@@ -122,8 +122,27 @@ public:
   /// Each call handles one client at a time — for concurrent clients, run
   /// multiple workers via the fork-based pool in main.cpp.
   ///
+  /// A connection is bounded: a client that never completes its request (a
+  /// stalled/slow FastCGI client) or keeps an idle keep-alive connection open
+  /// longer than set_connection_timeout_ms() is dropped, and the worker goes
+  /// back to accepting.  A worker is therefore never parked by a client that
+  /// sends nothing.
+  ///
   /// @return 0 on success, non-zero on error.
   int run();
+
+  /// @brief Bound how long a connection may take.
+  ///
+  /// Applies to (a) receiving a request, i.e. the FastCGI records of BEGIN_
+  /// REQUEST/PARAMS/STDIN, and (b) the idle wait for the next request on a
+  /// keep-alive connection.  It does *not* limit the handler: a long-poll is
+  /// bounded by kMaxClientWaitSec itself.  The FastCGI protocol has no
+  /// keep-alive timeout, so the client is expected to re-create the request
+  /// (CometVisu does this every 300 s); without a bound one client could pin a
+  /// worker forever.
+  ///
+  /// @param timeout_ms Deadline in milliseconds; values below 1 are ignored.
+  void set_connection_timeout_ms(int timeout_ms);
 
   /// @brief Request shutdown of the accept loop(s).
   ///
@@ -139,6 +158,35 @@ private:
   std::atomic<bool> shutdown_requested_{false};
   sem_t* load_shed_sem_ = nullptr;    // shared semaphore for load shedding (/r only)
   sem_t* concurrency_sem_ = nullptr;  // shared semaphore for long-poll (/r only)
+  int connection_timeout_ms_;         // see set_connection_timeout_ms()
+  /// Connection currently being served (or -1).  shutdown() uses it to
+  /// interrupt a worker that is blocked reading a request or waiting for the
+  /// next request on an idle keep-alive connection.
+  std::atomic<int> active_conn_{-1};
+
+  /// Accept one connection, waiting at most one poll slice.
+  ///
+  /// The listen socket is poll()ed in short slices so a shutdown request is
+  /// noticed even when no client connects (the classic accept() would block
+  /// until the socket is closed from another signal handler).
+  /// @return the connected fd, or -1 when the loop must end.
+  [[nodiscard]] int accept_connection();
+
+  /// Serve requests on one accepted connection until it is closed or idle for
+  /// longer than the connection timeout.
+  void serve_connection(int conn);
+
+  /// Handle the request that FCGX_Accept_r() just parsed (tokens, handler,
+  /// response).
+  void handle_request();
+
+  /// Set the receive/send timeout that bounds the work done for @p fd.
+  static void set_socket_timeout(int fd, int timeout_ms);
+
+  /// Wait until @p fd is readable (a further request arrived) or the deadline
+  /// expires.
+  /// @return true when a request is pending, false on timeout/EOF/error.
+  [[nodiscard]] static bool wait_for_request(int fd, int timeout_ms);
 
   /// Invoke the request handler, converting an exception into HTTP 500.
   ///

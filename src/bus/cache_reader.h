@@ -93,6 +93,9 @@ enum class Activity : std::uint8_t { Timeout, Data, Tx, Error };
 /// Outcome of one TX drain batch.
 struct TxDrain {
   int sent = 0;
+  /// How many of @c sent were `A_GroupValue_Read` requests (the last ones in
+  /// the batch — writes are always sent first).
+  int reads = 0;
   /// A send failed: the link is in trouble.  The caller must not spin — the
   /// telegram stays queued and is retried after a normal wait.
   bool failed = false;
@@ -107,6 +110,10 @@ struct TxDrain {
 /// The pacing is expressed as a *wait* (`TxDrain::wait_ms`), never as a sleep
 /// inside the link: an inbound telegram must still be delivered immediately
 /// (AGENTS.md rule 2).
+///
+/// Writes come first; queued `A_GroupValue_Read` requests follow, at most
+/// @c kMaxReadBurst per call, so a cold-cache refresh trickles out in little
+/// bursts and never delays a write.
 ///
 /// @param should_stop Checked between telegrams, so shutdown stays prompt.
 ///        An empty predicate means "never stop".

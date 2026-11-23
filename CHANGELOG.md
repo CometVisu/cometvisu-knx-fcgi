@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Protocol version 0.0.3**: `/l` now reports `0.0.3`, and the CometVisu
+  wiki pages `Protocol`/`Protokoll` document the rules this backend always
+  implemented (mandatory session id, numeric index, a long-poll that may end
+  with an empty answer, the KNX write APDU encoding, the optional bus state
+  object, `400`/`503`).  Existing clients are unaffected: they send `s` with
+  every request and accept the version.
+
 - **`SESSION_TTL_SEC` / `SESSION_MAX`** (default `1800` / `10000`): session
   lifetime and the number of concurrent sessions.  A *session* lives for
   minutes — it is deliberately independent of the request wait limit.
@@ -218,6 +225,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body length was taken from the wrong stream and an overflowing value threw
   out of the request loop.  The worker died (and was restarted), the request was
   lost.
+- **A served `/r` held its long-poll tokens until the client connection
+  ended.**  The capacity tokens were released after `FCGX_Finish_r()`, so a
+  sequential client could race the previous worker for the capacity: a pool of
+  two (one token) answered a spurious `503 {"error":"all workers busy"}` to the
+  next read, and an idle keep-alive connection held a token even longer.  A
+  token is now returned as soon as the handler returns, before the response is
+  written.
 - **The cache reader could stop reconnecting** when writes were in flight, so
   queued telegrams stayed stuck until a restart.
 - **A permanently failing send could spin the cache reader at 100 % CPU.**
@@ -225,6 +239,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent after the reconnect — a write is never lost silently.
 - **A rejected knxd connection leaked a file descriptor** per attempt when
   `KNXD_SOCKET` was misconfigured, eventually exhausting the process.
+- **One FastCGI connection could occupy a worker forever.**  The FastCGI
+  protocol has no keep-alive timeout and libfcgi hands a worker the whole
+  connection, so a client that never completed its request (a slow or silent
+  peer) or kept an idle keep-alive connection open parked that worker for
+  good — with `FCGI_WORKERS` such connections the pool was dead, and `/w` and
+  `/l` take no load-shedding token that could have protected them (verified:
+  with one worker, a second client was not served while a stalled connection
+  was open).  The worker now accepts the connection itself and bounds it with
+  `FCGI_CONNECTION_TIMEOUT_SEC` (default 330 s): a connection that makes no
+  progress is dropped and the worker serves the next client.
+- **A worker swallowed SIGTERM and could survive its supervisor.**
+  `FCGX_Init()` installs libfcgi's own SIGTERM handler, which only reacts while
+  libfcgi itself is blocked in `accept()`; because the server accepts on its
+  own, the handler consumed the signal.  The disposition is now restored after
+  `FCGX_Init()`, so `SIGTERM` (including `PR_SET_PDEATHSIG` when the supervisor
+  dies) stops the worker as intended.  `shutdown()` also interrupts the active
+  connection, so a stalled client cannot delay the stop.
+- **A `t=0` cold-cache read could delay every write.**  The handler pushed one
+  `A_GroupValue_Read` per uncached address into the shared TX ring (up to the
+  full 256 slots), and the ring is FIFO — a CometVisu config with hundreds of
+  addresses delayed a switch press behind the whole read storm.  Reads now use
+  their own lower-priority ring (`BusLink::request_group_read()`): the cache
+  reader sends any queued write first and then at most ten reads per drain call,
+  paced by the global send rate.
+- **A cold-cache read was truncated at 256 addresses.**  A client that
+  subscribes more addresses sends `t=0` only once, so the addresses beyond the
+  ring were never asked for and their tiles stayed empty forever.  The read ring
+  now holds 8192 pending requests (the protocol allows 4096 addresses per
+  request, so even a maximal list fits), and a rejection — several huge clients
+  at once — is logged instead of being silent.
 
 ## [1.2.1] — 2026-11-15
 

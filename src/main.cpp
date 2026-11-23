@@ -243,6 +243,10 @@ void print_help() {
             << "  FCGI_WORKERS          Worker processes (default: 20, max: 256)\n"
             << "  LONGPOLL_TIMEOUT_SEC  Max seconds to wait in long-poll /r (default: 300, max: "
             << kMaxLongpollTimeoutSec << ")\n"
+            << "  FCGI_CONNECTION_TIMEOUT_SEC\n"
+               "                        Max seconds a connection may make no progress before\n"
+               "                        it is dropped (default: 330, max: "
+            << kMaxLongpollTimeoutSec << ")\n"
             << "  KNX_TX_MAX_PER_SEC    Max outgoing telegrams per second over ALL clients\n"
             << "                        (default: 10, max: 1000)\n"
             << "  SESSION_TTL_SEC       Lifetime of a session in seconds (default: 1800)\n"
@@ -299,13 +303,19 @@ int run_discovery() {
 /// values must line up no matter how long the variable name is.
 void print_setting(std::string_view name, std::string_view value) {
   constexpr int kNameColumn = 22;
-  std::cout << "[INFO]   " << std::left << std::setw(kNameColumn) << name << std::right << value
-            << "\n";
+  std::cout << "[INFO]   " << std::left << std::setw(kNameColumn) << name;
+  // std::setw() does not pad a name that is longer than the column, so a long
+  // variable name (`FCGI_CONNECTION_TIMEOUT_SEC`) would run into its value.
+  if (name.size() >= static_cast<std::size_t>(kNameColumn)) {
+    std::cout << ' ';
+  }
+  std::cout << std::right << value << "\n";
 }
 
 /// Everything the banner shows about the environment.
 struct StartupSettings {
   int longpoll_timeout_sec;
+  int connection_timeout_sec;
   int num_workers;
   int max_tx_per_sec;
   std::string_view fcgi_socket;
@@ -323,6 +333,7 @@ void print_startup_info(const cvknx::BusConfig& bus_config, const StartupSetting
   print_setting("FCGI_SOCKET", settings.fcgi_socket);
   print_setting("FCGI_WORKERS", std::to_string(settings.num_workers));
   print_setting("LONGPOLL_TIMEOUT_SEC", std::to_string(settings.longpoll_timeout_sec));
+  print_setting("FCGI_CONNECTION_TIMEOUT_SEC", std::to_string(settings.connection_timeout_sec));
   print_setting("KNX_TX_MAX_PER_SEC", std::to_string(settings.max_tx_per_sec));
   print_setting("ADDRESS_PREFIX",
                 settings.address_prefix.empty() ? "(not set)" : settings.address_prefix);
@@ -743,6 +754,12 @@ int main(int argc, char* argv[]) {
 
   const int longpoll_timeout =
       parse_env_int("LONGPOLL_TIMEOUT_SEC", 300, 1, kMaxLongpollTimeoutSec);
+  // A FastCGI connection that makes no progress (a client that never finishes
+  // its request, or an idle keep-alive connection) is dropped after this many
+  // seconds: without it one client could park a worker forever, because the
+  // FastCGI protocol has no keep-alive timeout of its own.
+  const int connection_timeout_sec = parse_env_int(
+      "FCGI_CONNECTION_TIMEOUT_SEC", kMaxLongpollTimeoutSec, 1, kMaxLongpollTimeoutSec);
   const int num_workers = parse_env_int("FCGI_WORKERS", 20, 1, 256);
   // Parsed once and handed to the cache reader: the banner and the enforced
   // limit must never disagree.
@@ -778,9 +795,10 @@ int main(int argc, char* argv[]) {
   }
 
   KnxAddress::set_default_namespace(address_prefix);
-  print_startup_info(bus_config,
-                     StartupSettings{longpoll_timeout, num_workers, max_tx_per_sec, fcgi_socket,
-                                     address_prefix, base_url != nullptr ? base_url : ""});
+  print_startup_info(
+      bus_config,
+      StartupSettings{longpoll_timeout, connection_timeout_sec, num_workers, max_tx_per_sec,
+                      fcgi_socket, address_prefix, base_url != nullptr ? base_url : ""});
 
   // ---- Initialize FCGI server (before the bus) ----
   // Set up the FastCGI listen socket first so it's ready for connections before
@@ -795,6 +813,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   // GCOV_EXCL_STOP
+
+  // Bound a FastCGI connection before the first fork: every worker inherits the
+  // value, and a client that never finishes its request (or holds an idle
+  // keep-alive connection) can therefore not park a worker forever.
+  server.set_connection_timeout_ms(connection_timeout_sec * 1000);
 
   // FastCGI has no transport authentication and the handlers trust the web
   // server to authenticate, so the endpoint itself is the whole access

@@ -70,6 +70,17 @@ bool MockBusLink::send_group_packet(uint16_t addr, const std::vector<uint8_t>& a
   return true;
 }
 
+bool MockBusLink::request_group_read(uint16_t addr) {
+  read_request_calls_++;
+  if (read_fail_count_ > 0) {
+    read_fail_count_--;
+    return false;
+  }
+  // Deliberately the *default* implementation: the mock only counts, so the
+  // shared BusLink base behaviour is exercised by every handler test.
+  return BusLink::request_group_read(addr);
+}
+
 bool MockBusLink::poll_group_telegram(uint16_t& out_group_addr, std::vector<uint8_t>& out_apdu) {
   if (telegram_queue_.empty()) {
     return false;
@@ -91,7 +102,6 @@ uint64_t MockBusLink::get_telegram_count() const {
 }
 
 void MockBusLink::set_nonblocking(bool /*enable*/) {}
-
 BusLink::WaitResult MockBusLink::wait_for_activity(int /*timeout_ms*/) {
   wait_calls_++;
   if (!connected_) {
@@ -123,6 +133,8 @@ void MockBusLink::reset() {
   wait_error_count_ = 0;
   connect_calls_ = 0;
   wait_calls_ = 0;
+  read_request_calls_ = 0;
+  read_fail_count_ = 0;
   min_send_interval_ms_ = 0;
   disconnect_on_send_failure_ = false;
 }

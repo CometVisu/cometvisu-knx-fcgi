@@ -90,9 +90,10 @@ using Params = std::vector<std::pair<std::string, std::string>>;
 
 /// A complete request: BEGIN_REQUEST, PARAMS, STDIN (plus the empty records
 /// that terminate both streams).
-Bytes BuildRequest(const Params& params, const Bytes& body = {}) {
-  // role = FCGI_RESPONDER (1), flags = 0, reserved = 0
-  Bytes request = Record(kBeginRequest, Bytes{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+Bytes BuildRequest(const Params& params, const Bytes& body = {}, bool keep_conn = false) {
+  // role = FCGI_RESPONDER (1), flags = FCGI_KEEP_CONN (1) or 0, reserved = 0
+  const std::uint8_t flags = keep_conn ? 0x01 : 0x00;
+  Bytes request = Record(kBeginRequest, Bytes{0x00, 0x01, flags, 0x00, 0x00, 0x00, 0x00, 0x00});
 
   Bytes pairs;
   for (const auto& [name, value] : params) {
@@ -153,8 +154,12 @@ std::string SocketPath(const char* tag) {
 /// Runs FcgiServer::run() in a child process and talks to it over a socket.
 class ServerProcess {
 public:
-  ServerProcess(FcgiServer& server, bool use_concurrency_sem, bool use_load_shed_sem)
+  ServerProcess(FcgiServer& server, bool use_concurrency_sem, bool use_load_shed_sem,
+                int connection_timeout_ms = 0)
       : path_(SocketPath("run")) {
+    if (connection_timeout_ms > 0) {
+      server.set_connection_timeout_ms(connection_timeout_ms);
+    }
     // Semaphores live in shared memory so the parent can inspect them.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     sems_ = static_cast<sem_t*>(::mmap(nullptr, 2 * sizeof(sem_t), PROT_READ | PROT_WRITE,
@@ -310,6 +315,101 @@ public:
     return sems_ != nullptr && ::sem_trywait(&sems_[1]) == 0;
   }
 
+  /// Send one request on the current connection without reading the reply.
+  [[nodiscard]] bool SendRequest(const Params& params, const Bytes& body = {}) {
+    return SendBytes(BuildRequest(params, body));
+  }
+
+  /// Send raw bytes on the current connection (a partial request, for example).
+  [[nodiscard]] bool SendBytes(const Bytes& request) {
+    if (fd_ < 0 && !Connect()) {
+      return false;
+    }
+    size_t sent = 0;
+    while (sent < request.size()) {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+      const ssize_t written = ::send(fd_, request.data() + sent, request.size() - sent, 0);
+      if (written <= 0) {
+        return false;
+      }
+      sent += static_cast<size_t>(written);
+    }
+    return true;
+  }
+
+  /// Send one request that asks for the connection to stay open and read its
+  /// response, leaving the connection available for the next request.
+  std::string ExchangeKeepAlive(const Params& params) {
+    if (!SendBytes(BuildRequest(params, {}, /*keep_conn=*/true))) {
+      return {};
+    }
+    return ReadResponse();
+  }
+
+  /// Detach the current connection: the test keeps the descriptor open (to
+  /// present an idle or stalled client), the next Exchange reconnects.
+  int ReleaseConnection() {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+
+  /// Close the current connection and allow the next request to reconnect.
+  void CloseConnection() {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  /// True once the peer closed the connection (EOF) within @p timeout_ms.
+  [[nodiscard]] bool PeerClosed(int fd, int timeout_ms = 5000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+      char discard[512] = {};
+      const ssize_t n = ::recv(fd, discard, sizeof(discard), 0);
+      if (n == 0) {
+        return true;
+      }
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;  // SO_RCVTIMEO slice elapsed, keep waiting
+        }
+        return errno == ECONNRESET || errno == EPIPE;
+      }
+    }
+    return false;
+  }
+
+  /// Wait until the reply has started to arrive, without consuming it.
+  [[nodiscard]] bool WaitForReplyBytes(int timeout_ms = 5000) const {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+      std::uint8_t byte = 0;
+      const ssize_t n = ::recv(fd_, &byte, 1, MSG_PEEK);
+      if (n > 0) {
+        return true;
+      }
+      if (n == 0) {
+        return false;  // connection closed without a reply
+      }
+      if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /// Read the rest of the in-flight reply and close the connection.
+  std::string FinishExchange() {
+    std::string payload = ReadResponse();
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+    return payload;
+  }
+
   /// Send one request and return the response body (STDOUT records joined).
   /// Opens a fresh connection when needed — libfcgi closes the connection after
   /// a response unless the client asked for keep-alive.
@@ -425,6 +525,130 @@ TEST(FcgiServerRunTest, ServesMultipleRequestsOnOneConnection) {
 }
 
 // ================================================================
+// Connection lifetime — a client must never park a worker
+// ================================================================
+
+/// A keep-alive connection really carries more than one request.
+///
+/// The worker owns the accepted connection now, so this is the regression test
+/// for the request loop: libfcgi must be handed the fd (with keepConnection set)
+/// for every further request on the same connection.
+TEST(FcgiServerRunTest, KeepAliveConnectionServesSeveralRequests) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  ServerProcess proc(server, false, false);
+  ASSERT_TRUE(proc.connected());
+
+  const std::string first =
+      proc.ExchangeKeepAlive({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  EXPECT_NE(first.find("Status: 200"), std::string::npos) << first;
+  const std::string second =
+      proc.ExchangeKeepAlive({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/r"}});
+  EXPECT_NE(second.find(R"("path":"/r")"), std::string::npos) << second;
+
+  // The client closes the (still open) keep-alive connection: the worker must
+  // notice the EOF and go back to accepting instead of keeping it forever.
+  const int closed_fd = proc.ReleaseConnection();
+  ::close(closed_fd);
+  const std::string third = proc.Exchange({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  EXPECT_NE(third.find("Status: 200"), std::string::npos) << third;
+}
+
+/// An idle keep-alive connection is dropped after the deadline and the worker
+/// returns to accepting: a client that never sends its next request must not
+/// occupy a worker (the FastCGI protocol has no keep-alive timeout of its own).
+TEST(FcgiServerRunTest, IdleKeepAliveConnectionIsDroppedAfterTheTimeout) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  ServerProcess proc(server, false, false, /*connection_timeout_ms=*/200);
+  ASSERT_TRUE(proc.connected());
+  const std::string first =
+      proc.ExchangeKeepAlive({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  ASSERT_NE(first.find("Status: 200"), std::string::npos) << first;
+
+  // The connection stays open but idle; the worker must give up on it.
+  const int idle_fd = proc.ReleaseConnection();
+  const std::string body = proc.Exchange({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/w"}});
+  EXPECT_NE(body.find("Status: 200"), std::string::npos) << body;
+  EXPECT_TRUE(proc.PeerClosed(idle_fd)) << "the idle keep-alive connection was never closed";
+  ::close(idle_fd);
+}
+
+/// A client that connects and sends nothing at all is dropped after the
+/// deadline; the worker serves the next connection in the meantime.
+TEST(FcgiServerRunTest, SilentConnectionIsDroppedAfterTheTimeout) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  ServerProcess proc(server, false, false, /*connection_timeout_ms=*/200);
+  ASSERT_TRUE(proc.connected());
+  const int silent_fd = proc.ReleaseConnection();  // connected, not a single byte sent
+
+  const std::string body = proc.Exchange({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  EXPECT_NE(body.find("Status: 200"), std::string::npos) << body;
+  EXPECT_TRUE(proc.PeerClosed(silent_fd)) << "the silent connection was never closed";
+  ::close(silent_fd);
+}
+
+/// A half-sent request (BEGIN_REQUEST without the PARAMS terminator) is a
+/// slowloris: it must be dropped after the deadline instead of pinning the
+/// worker forever.
+TEST(FcgiServerRunTest, StalledRequestIsDroppedAfterTheTimeout) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  ServerProcess proc(server, false, false, /*connection_timeout_ms=*/200);
+  ASSERT_TRUE(proc.connected());
+  // BEGIN_REQUEST + a PARAMS record, but no empty PARAMS record to end them.
+  Bytes partial = Record(kBeginRequest, Bytes{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+  const Bytes params = Record(kParams, Param("REQUEST_METHOD", "GET"));
+  partial.insert(partial.end(), params.begin(), params.end());
+  ASSERT_TRUE(proc.SendBytes(partial));
+  const int stalled_fd = proc.ReleaseConnection();
+
+  const std::string body = proc.Exchange({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  EXPECT_NE(body.find("Status: 200"), std::string::npos) << body;
+  EXPECT_TRUE(proc.PeerClosed(stalled_fd)) << "the stalled request was never dropped";
+  ::close(stalled_fd);
+}
+
+/// The idle accept loop keeps serving after its poll slice expires (the worker
+/// is not blocked in accept(), it re-checks the shutdown flag every slice).
+TEST(FcgiServerRunTest, IdleAcceptLoopKeepsServingAfterTheSlice) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  ServerProcess proc(server, false, false);
+  ASSERT_TRUE(proc.connected());
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));  // > kAcceptPollSliceMs
+
+  const std::string body = proc.Exchange({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/l"}});
+  EXPECT_NE(body.find("Status: 200"), std::string::npos) << body;
+}
+
+/// A shutdown must also end a worker that is blocked reading a request.  The
+/// production connection timeout is minutes long, so without shutdown() waking
+/// the active connection the worker would sit in the read until it expires.
+TEST(FcgiServerRunTest, ShutdownEndsAWorkerBlockedWaitingForARequest) {
+  FcgiServer server;
+  server.set_handler(MakeHandler(Behaviour::Echo));
+
+  int silent_fd = -1;
+  {
+    // A long deadline: only the shutdown may end the read.
+    ServerProcess proc(server, false, false, /*connection_timeout_ms=*/60000);
+    ASSERT_TRUE(proc.connected());
+    silent_fd = proc.ReleaseConnection();  // connected, not a single byte sent
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // ~ServerProcess() sends SIGUSR1 and waits for the child: the worker must
+    // return promptly instead of waiting for the 60 s deadline.
+  }
+  ::close(silent_fd);
+}
+
+// ================================================================
 // Handler failures become HTTP 500
 // ================================================================
 
@@ -497,6 +721,46 @@ TEST(FcgiServerRunTest, LongPollReturnsBothTokensAfterTheResponse) {
   EXPECT_NE(body.find("Status: 200"), std::string::npos) << body;
   // Both tokens are released by their destructors at the end of the iteration.
   EXPECT_TRUE(proc.wait_for_tokens(1));
+}
+
+/// A worker's long-poll capacity must be back in the pool *before* the client
+/// can see its response finished.
+///
+/// Regression test: the tokens used to be released after FCGX_Finish_r() had
+/// closed the connection, so a sequential client could send its next request
+/// while the previous worker still held its token.  With a pool of two (one
+/// token, see longpoll_capacity()) the follow-up `/r` was then answered
+/// `503 {"error":"all workers busy"}` — the intermittent CI failure of
+/// test_main_e2e's OldestSessionIsEvictedWhenTheStoreIsFull.
+TEST(FcgiServerRunTest, LongPollTokensAreReleasedBeforeTheResponseIsWritten) {
+  FcgiServer server;
+  server.set_handler([](const FcgiRequest&) {
+    FcgiResponse response;
+    response.status_code = 200;
+    response.content_type = "application/json";
+    // Far larger than any socket buffer: the server cannot finish writing
+    // until the test drains it, so "the response is still in flight" is a
+    // state the test can reliably observe.
+    response.body = std::string(8U * 1024U * 1024U, 'x');
+    return response;
+  });
+
+  ServerProcess proc(server, true, true);
+  ASSERT_TRUE(proc.connected());
+
+  ASSERT_TRUE(proc.SendRequest({{"REQUEST_METHOD", "GET"}, {"REQUEST_URI", "/r"}}));
+  ASSERT_TRUE(proc.WaitForReplyBytes()) << "the server never started writing the response";
+
+  // The handler has returned and its response is on the wire: the tokens must
+  // already be free, otherwise the next client races into a spurious 503.
+  EXPECT_EQ(proc.concurrency_tokens(), 1)
+      << "the long-poll token is only returned after the response was written";
+  EXPECT_EQ(proc.load_shed_tokens(), 1)
+      << "the load-shedding token is only returned after the response was written";
+
+  // Drain the rest so the child can finish the request and shut down.
+  const std::string body = proc.FinishExchange();
+  EXPECT_NE(body.find("Status: 200"), std::string::npos) << body.substr(0, 200);
 }
 
 TEST(FcgiServerRunTest, WriteAndLoginNeverTakeAToken) {
