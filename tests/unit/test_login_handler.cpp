@@ -20,8 +20,10 @@
 
 #include "handlers/login_handler.h"
 #include "state/session_store.h"
+#include "util/json_builder.h"
+#include "version.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 namespace {
 
@@ -45,6 +47,107 @@ private:
   const char* name_;
 };
 
+// ================================================================
+// Config block builder — every combination of known/unknown build info
+// ================================================================
+
+TEST(LoginConfigBlockTest, EmptyInfoProducesNoBlock) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{});
+  json.end_object();
+  EXPECT_EQ(json.take(), "{}");
+}
+
+TEST(LoginConfigBlockTest, UnknownValuesAreNotReported) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "",
+                         LoginBuildInfo{.fcgi_version = "unknown", .fcgi_hash = "unknown"});
+  json.end_object();
+  EXPECT_EQ(json.take(), "{}");
+}
+
+TEST(LoginConfigBlockTest, OnlyFcgiVersion) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{.fcgi_version = "2.0.0"});
+  json.end_object();
+  const std::string out = json.take();
+  EXPECT_NE(out.find(R"("fcgiVersion":"2.0.0")"), std::string::npos) << out;
+  EXPECT_EQ(out.find("fcgiGitHash"), std::string::npos) << out;
+}
+
+TEST(LoginConfigBlockTest, OnlyFcgiHash) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{.fcgi_hash = "abc1234"});
+  json.end_object();
+  const std::string out = json.take();
+  EXPECT_NE(out.find(R"("fcgiGitHash":"abc1234")"), std::string::npos) << out;
+  EXPECT_EQ(out.find("fcgiVersion"), std::string::npos) << out;
+}
+
+TEST(LoginConfigBlockTest, OnlyKnxdVersion) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{.knxd_version = "0.14.57"});
+  json.end_object();
+  const std::string out = json.take();
+  EXPECT_NE(out.find(R"("knxdBuildVersion":"0.14.57")"), std::string::npos) << out;
+  EXPECT_EQ(out.find("knxdBuildGitHash"), std::string::npos) << out;
+}
+
+TEST(LoginConfigBlockTest, OnlyKnxdHash) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{.knxd_hash = "deadbee"});
+  json.end_object();
+  const std::string out = json.take();
+  EXPECT_NE(out.find(R"("knxdBuildGitHash":"deadbee")"), std::string::npos) << out;
+  EXPECT_EQ(out.find("knxdBuildVersion"), std::string::npos) << out;
+}
+
+TEST(LoginConfigBlockTest, OnlyExtraConfig) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "", LoginBuildInfo{.extra_config = R"("foo":"bar")"});
+  json.end_object();
+  EXPECT_NE(json.take().find(R"("foo":"bar")"), std::string::npos);
+}
+
+TEST(LoginConfigBlockTest, EverythingKnownIsReportedTogether) {
+  JsonBuilder json;
+  json.start_object();
+  add_login_config_block(json, "/proxy/visu",
+                         LoginBuildInfo{.fcgi_version = "2.0.0",
+                                        .fcgi_hash = "abc1234",
+                                        .knxd_version = "0.14.57",
+                                        .knxd_hash = "deadbee",
+                                        .extra_config = R"("x":1)"});
+  json.end_object();
+  const std::string out = json.take();
+  for (const char* fragment :
+       {R"("baseURL":"/proxy/visu")", R"("fcgiVersion":"2.0.0")", R"("fcgiGitHash":"abc1234")",
+        R"("knxdBuildVersion":"0.14.57")", R"("knxdBuildGitHash":"deadbee")", R"("x":1)"}) {
+    EXPECT_NE(out.find(fragment), std::string::npos) << fragment << " missing in " << out;
+  }
+}
+
+TEST(LoginHandlerTest, UserWithoutPasswordIsAuthenticated) {
+  SessionStore sessions;
+  LoginHandler handler(sessions);
+  const std::string body = handler.handle("u=admin");
+  // Only "u" was given, so this is not the anonymous path (id != "0").
+  EXPECT_EQ(body.find(R"("s":"0")"), std::string::npos) << body;
+}
+
+TEST(LoginHandlerTest, PasswordWithoutUserIsAuthenticated) {
+  SessionStore sessions;
+  LoginHandler handler(sessions);
+  const std::string body = handler.handle("p=secret");
+  EXPECT_EQ(body.find(R"("s":"0")"), std::string::npos) << body;
+}
 }  // namespace
 
 TEST(LoginHandlerTest, AnonymousLogin) {
@@ -214,7 +317,11 @@ TEST(LoginHandlerTest, ConfigBlockIncludesVersionInfo) {
   std::string response = handler.handle("");
   EXPECT_NE(response.find("\"c\""), std::string::npos);
   EXPECT_NE(response.find("\"fcgiVersion\":"), std::string::npos);
-  EXPECT_NE(response.find("\"fcgiGitHash\":"), std::string::npos);
+  // The git hash is only advertised when the build could determine one:
+  // builds from a source tarball (or a checkout whose ownership git refuses)
+  // have no hash, and then the key must be omitted rather than sent empty.
+  const bool have_git_hash = !git_hash().empty() && git_hash() != "unknown";
+  EXPECT_EQ(response.find("\"fcgiGitHash\":") != std::string::npos, have_git_hash);
 }
 
 TEST(LoginHandlerTest, ConfigBlockWithBaseUrlIncludesVersionInfo) {
@@ -225,7 +332,8 @@ TEST(LoginHandlerTest, ConfigBlockWithBaseUrlIncludesVersionInfo) {
   std::string response = handler.handle("");
   EXPECT_NE(response.find("\"baseURL\":\"/proxy/visu\""), std::string::npos);
   EXPECT_NE(response.find("\"fcgiVersion\":"), std::string::npos);
-  EXPECT_NE(response.find("\"fcgiGitHash\":"), std::string::npos);
+  const bool have_git_hash = !git_hash().empty() && git_hash() != "unknown";
+  EXPECT_EQ(response.find("\"fcgiGitHash\":") != std::string::npos, have_git_hash);
 }
 
 TEST(LoginHandlerTest, LogExtraConfigEnvVar) {

@@ -32,9 +32,9 @@ if(NOT _git_result EQUAL 0 OR GIT_HASH STREQUAL "")
     set(GIT_HASH "unknown")
 endif()
 
-project(cometvisu-knxd-fcgi
+project(cometvisu-knx-fcgi
     VERSION ${PROJECT_VERSION_STRING}
-    DESCRIPTION "FastCGI backend bridging CometVisu Protocol to knxd"
+    DESCRIPTION "FastCGI backend bridging CometVisu Protocol to KNX (knxd, KNXnet/IP)"
     LANGUAGES CXX
 )
 
@@ -51,6 +51,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---- Options ----
 option(BUILD_TESTING "Build tests" ON)
 option(ENABLE_SANITIZERS "Enable address/undefined-behavior sanitizers" OFF)
+# gcov instrumentation for the coverage gate (tools/check_coverage.py).
+# A separate build directory is required: a normal build must not carry the
+# counters, and stale .gcda files would silently dilute the result.
+option(ENABLE_COVERAGE "Instrument the build for gcov coverage measurement" OFF)
+# The knxd (eibd Unix socket) transport needs <eibtypes.h>.  KNXnet/IP needs no
+# external header at all, so the transport can be switched off for builds that
+# must not depend on knxd-dev being installed.
+option(KNX_BUILD_KNXD_TRANSPORT "Build the knxd (eibd Unix socket) transport" ON)
 
 # Path to a knxd source checkout (e.g. -DKNXD_SOURCE_DIR=/path/to/knxd).
 # When set, headers are taken from <KNXD_SOURCE_DIR>/include/ instead of
@@ -84,9 +92,11 @@ if(NOT FCGI_INCLUDE_DIR)
 endif()
 
 # Find knxd development headers (eibtypes.h for protocol constants).
+# Only needed when the knxd transport is built; KNXnet/IP needs no knxd.
 # Supports two modes:
 #   1. -DKNXD_SOURCE_DIR=/path/to/knxd  → uses headers from a source checkout
 #   2. Omitting KNXD_SOURCE_DIR          → uses system-installed knxd-dev package
+if(KNX_BUILD_KNXD_TRANSPORT)
 if(KNXD_SOURCE_DIR)
     # User provided a knxd source checkout — look for eibtypes.h there.
     # knxd keeps its public headers in <source>/include/.
@@ -178,6 +188,14 @@ else()
     message(STATUS "Using knxd headers from system: ${KNXD_INCLUDE_DIR}")
 endif()
 
+    add_compile_definitions(KNX_WITH_KNXD_TRANSPORT=1)
+else()
+    set(KNXD_INCLUDE_DIR "")
+    set(KNXD_BUILD_VERSION "")
+    set(KNXD_BUILD_GIT_HASH "")
+    message(STATUS "knxd transport disabled (KNX_BUILD_KNXD_TRANSPORT=OFF)")
+endif()
+
 # ---- Compiler Settings ----
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
@@ -188,6 +206,17 @@ if(ENABLE_SANITIZERS)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+if(ENABLE_COVERAGE)
+    # -O0 keeps line/branch mapping exact; --coverage adds -fprofile-arcs
+    # -ftest-coverage.  Atomic updates are mandatory here: the tests fork
+    # worker processes that all write the same .gcda files.
+    add_compile_options(--coverage -O0 -g -fprofile-update=atomic)
+    add_link_options(--coverage)
+    # Lets forked children flush their counters before std::_Exit().
+    add_compile_definitions(KNX_COVERAGE=1)
+    message(STATUS "Coverage instrumentation enabled (gcov)")
+endif()
+
 # ---- Subdirectories ----
 add_subdirectory(src)
 if(BUILD_TESTING)
@@ -196,4 +225,4 @@ if(BUILD_TESTING)
 endif()
 
 # ---- Install ----
-install(TARGETS cometvisu-knxd-fcgi RUNTIME DESTINATION bin)
+install(TARGETS cometvisu-knx-fcgi RUNTIME DESTINATION bin)

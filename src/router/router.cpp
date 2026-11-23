@@ -20,13 +20,13 @@
 
 #include "router.h"
 
-namespace cvknxd {
+namespace cvknx {
 
-Router::Router(KnxdClientInterface& knxd, SharedGroupCache& cache, SessionStore& sessions,
-               int longpoll_timeout_sec, std::string base_url)
+Router::Router(BusLink& knxd, SharedGroupCache& cache, SessionStore& sessions,
+               int longpoll_timeout_sec, std::string base_url, std::string outage_key)
     : login_handler_(sessions, std::move(base_url)),
-      read_handler_(cache, knxd, sessions, longpoll_timeout_sec),
-      write_handler_(knxd, sessions, &cache) {}
+      read_handler_(cache, knxd, sessions, longpoll_timeout_sec, outage_key),
+      write_handler_(knxd, sessions, &cache, std::move(outage_key)) {}
 
 FcgiResponse Router::route(const FcgiRequest& request) {
   FcgiResponse response;
@@ -56,4 +56,4 @@ FcgiResponse Router::route(const FcgiRequest& request) {
   return response;
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

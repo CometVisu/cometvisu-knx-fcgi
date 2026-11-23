@@ -13,26 +13,34 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+/**
+ * @file mock_bus_link.h
+ * @brief Scriptable BusLink for unit and integration tests.
+ */
+
 #pragma once
 
 #include <cstdint>
 #include <queue>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
-#include "../src/knxd/knxd_client.h"
+#include "../src/bus/bus_link.h"
 
-namespace cvknxd {
+namespace cvknx {
 
-class MockKnxdClient : public KnxdClientInterface {
+class MockBusLink : public BusLink {
 public:
-  MockKnxdClient() = default;
+  MockBusLink() = default;
 
-  [[nodiscard]] bool connect(std::string_view socket_path) override;
+  [[nodiscard]] bool connect() override {
+    return connect(std::string_view{"/run/knx"}) && open_group_socket(false);
+  }
+  [[nodiscard]] bool connect(std::string_view socket_path);
   void disconnect() override;
-  [[nodiscard]] bool reconnect() override;
   [[nodiscard]] bool is_connected() const override;
-  [[nodiscard]] bool open_group_socket(bool write_only) override;
   [[nodiscard]] bool send_group_packet(uint16_t group_addr,
                                        const std::vector<uint8_t>& apdu) override;
   [[nodiscard]] bool poll_group_telegram(uint16_t& out_group_addr,
@@ -41,6 +49,10 @@ public:
   [[nodiscard]] uint64_t get_telegram_count() const override;
   void set_nonblocking(bool enable) override;
   [[nodiscard]] WaitResult wait_for_activity(int timeout_ms) override;
+  [[nodiscard]] std::string label() const override { return "mock bus link"; }
+
+  /// Open the group socket (test helper, not part of BusLink).
+  [[nodiscard]] bool open_group_socket(bool write_only);
 
   // --- test helpers ---
   void set_connection_success(bool success) { connection_success_ = success; }
@@ -56,6 +68,12 @@ public:
   void set_connect_fail_count(int count) { connect_fail_count_ = count; }
   /// Number of upcoming wait_for_activity() calls that report a lost connection.
   void set_wait_error_count(int count) { wait_error_count_ = count; }
+  /// Minimal interval between two sends, as a real transport would declare it.
+  void set_min_send_interval_ms(int interval_ms) { min_send_interval_ms_ = interval_ms; }
+  /// Drop the connection when a scripted send fails — the real transports do
+  /// exactly that so the cache reader notices the dead link.
+  void set_disconnect_on_send_failure(bool enable) { disconnect_on_send_failure_ = enable; }
+  [[nodiscard]] int min_send_interval_ms() const override { return min_send_interval_ms_; }
   /// Number of connect() calls so far (used to detect reconnect behaviour).
   [[nodiscard]] int connect_calls() const { return connect_calls_; }
   /// Number of wait_for_activity() calls so far (used to detect busy loops).
@@ -74,6 +92,8 @@ private:
   std::vector<SentPacket> sent_packets_;
   uint64_t telegram_count_ = 0;
   int send_fail_count_ = 0;
+  int min_send_interval_ms_ = 0;
+  bool disconnect_on_send_failure_ = false;
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

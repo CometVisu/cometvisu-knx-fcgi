@@ -19,12 +19,12 @@
 #include "handlers/login_handler.h"
 #include "handlers/read_handler.h"
 #include "handlers/write_handler.h"
-#include "mock_knxd_socket.h"
+#include "mock_bus_link.h"
 #include "router/router.h"
 #include "state/session_store.h"
 #include "state/shared_group_cache.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 /// End-to-end tests simulating full CometVisu protocol flows.
 class FullFlowTest : public ::testing::Test {
@@ -35,7 +35,7 @@ protected:
     (void)knxd_.open_group_socket(false);
   }
 
-  MockKnxdClient knxd_;     // NOLINT
+  MockBusLink knxd_;        // NOLINT
   SharedGroupCache cache_;  // NOLINT
   SessionStore sessions_;   // NOLINT
 };
@@ -45,7 +45,7 @@ protected:
 TEST_F(FullFlowTest, AnonymousLogin) {
   LoginHandler handler(sessions_);
 
-  std::string response = handler.handle("");
+  std::string response = handler.handle("s=0&");
   EXPECT_NE(response.find("\"v\":\"0.0.2\""), std::string::npos);
   EXPECT_NE(response.find("\"s\":\"0\""), std::string::npos);
 }
@@ -53,7 +53,7 @@ TEST_F(FullFlowTest, AnonymousLogin) {
 TEST_F(FullFlowTest, AuthenticatedLogin) {
   LoginHandler handler(sessions_);
 
-  std::string response = handler.handle("u=admin&p=secret&d=mydevice");
+  std::string response = handler.handle("s=0&u=admin&p=secret&d=mydevice");
   EXPECT_NE(response.find("\"v\":\"0.0.2\""), std::string::npos);
 
   // Session ID should NOT be "0"
@@ -66,14 +66,14 @@ TEST_F(FullFlowTest, WriteThenRead) {
   WriteHandler write_handler(knxd_, sessions_);
   ReadHandler read_handler(cache_, knxd_, sessions_);
   // Step 1: Write a value
-  auto write_result = write_handler.handle("a=KNX:1/2/3&v=800c6f");
+  auto write_result = write_handler.handle("s=0&a=KNX:1/2/3&v=800c6f");
   EXPECT_EQ(write_result.http_status, 200);
 
   // Step 2: Populate GroupCache (simulating group telegram echo from knxd)
   cache_.push(0x0A03, {0x0C, 0x6F});
 
   // Step 3: Read from knxd's cache
-  auto read_result = read_handler.handle("a=KNX:1/2/3&t=30");
+  auto read_result = read_handler.handle("s=0&a=KNX:1/2/3&t=30");
   EXPECT_EQ(read_result.http_status, 200);
   EXPECT_NE(read_result.body.find("0c6f"), std::string::npos);
 }
@@ -101,7 +101,7 @@ TEST_F(FullFlowTest, RouterReadRoute) {
   FcgiRequest req;
   req.request_method = "GET";
   req.path_info = "/r";
-  req.query_string = "a=KNX:1/2/3&t=30";
+  req.query_string = "s=0&a=KNX:1/2/3&t=30";
 
   auto resp = router.route(req);
   EXPECT_EQ(resp.status_code, 200);
@@ -114,7 +114,7 @@ TEST_F(FullFlowTest, RouterWriteRoute) {
   FcgiRequest req;
   req.request_method = "GET";
   req.path_info = "/w";
-  req.query_string = "a=KNX:1/2/3&v=8042";
+  req.query_string = "s=0&a=KNX:1/2/3&v=8042";
 
   auto resp = router.route(req);
   EXPECT_EQ(resp.status_code, 200);
@@ -153,7 +153,7 @@ TEST_F(FullFlowTest, ReadResponseStructure) {
   ReadHandler handler(cache_, knxd_, sessions_);
   cache_.push(0x0A03, {0x42});
 
-  auto result = handler.handle("a=KNX:1/2/3&t=30");
+  auto result = handler.handle("s=0&a=KNX:1/2/3&t=30");
 
   // Should have "d" object and "i" index
   EXPECT_NE(result.body.find("\"d\":"), std::string::npos);
@@ -169,7 +169,7 @@ TEST_F(FullFlowTest, KnxdCacheIsUsedForReads) {
   cache_.push(0x0A03, data);
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto result = handler.handle("a=KNX:1/2/3&t=30");
+  auto result = handler.handle("s=0&a=KNX:1/2/3&t=30");
   EXPECT_NE(result.body.find("0c6f"), std::string::npos);
 }
 
@@ -177,13 +177,13 @@ TEST_F(FullFlowTest, KnxdCacheIsUsedForReads) {
 
 TEST_F(FullFlowTest, RouterForwardsTheWriteErrorBody) {
   Router router(knxd_, cache_, sessions_, 1, "");
-  cache_.publish_knxd_status(true, 1000);
-  cache_.publish_knxd_status(false, 1500);
+  cache_.publish_bus_status(true, 1000);
+  cache_.publish_bus_status(false, 1500);
   knxd_.set_send_fail_count(1);
 
   FcgiRequest request;
   request.request_uri = "/w";
-  request.query_string = "a=KNX:1/2/3&v=8042";
+  request.query_string = "s=0&a=KNX:1/2/3&v=8042";
 
   const auto response = router.route(request);
 

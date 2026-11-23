@@ -17,7 +17,7 @@
 
 #include "util/json_builder.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 TEST(JsonBuilderTest, Empty) {
   JsonBuilder jb;
@@ -132,4 +132,32 @@ TEST(JsonBuilderTest, AddBoolInsideNestedObject) {
   jb.end_object();
   jb.end_object();
   EXPECT_EQ(jb.str(), R"({"i":3,"knxd":{"ok":false}})");
+}
+
+TEST(JsonBuilderTest, EscapesControlCharacters) {
+  JsonBuilder jb;
+  jb.start_object();
+  jb.add_string("k", "back\\slash\nnewline\rcr\ttab");
+  jb.end_object();
+  const std::string text = jb.str();
+  EXPECT_NE(text.find("\\\\"), std::string::npos) << text;
+  EXPECT_NE(text.find("\\n"), std::string::npos) << text;
+  EXPECT_NE(text.find("\\r"), std::string::npos) << text;
+  EXPECT_NE(text.find("\\t"), std::string::npos) << text;
+}
+
+// A raw C0 control character is not valid inside a JSON string.  Escape it so a
+// single odd byte can never make the whole response unparsable.
+TEST(JsonBuilderTest, ControlCharactersAreEscaped) {
+  JsonBuilder jb;
+  jb.start_object();
+  jb.add_string("k", std::string{"a\x01"
+                                 "b\x1f"
+                                 "c\x7f"});
+  jb.end_object();
+
+  const std::string text = jb.str();
+  EXPECT_NE(text.find("\\u0001"), std::string::npos) << text;
+  EXPECT_NE(text.find("\\u001f"), std::string::npos) << text;
+  EXPECT_NE(text.find("\\u007f"), std::string::npos) << text;
 }

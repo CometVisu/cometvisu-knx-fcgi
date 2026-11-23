@@ -13,11 +13,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "mock_knxd_socket.h"
+/**
+ * @file mock_bus_link.cpp
+ * @brief Scriptable BusLink for unit and integration tests.
+ */
 
-namespace cvknxd {
+#include "mock_bus_link.h"
 
-bool MockKnxdClient::connect(std::string_view socket_path) {
+namespace cvknx {
+
+bool MockBusLink::connect(std::string_view socket_path) {
   last_socket_path_ = socket_path;
   connect_calls_++;
   if (connect_fail_count_ > 0) {
@@ -28,43 +33,44 @@ bool MockKnxdClient::connect(std::string_view socket_path) {
   connected_ = connection_success_;
   return connected_;
 }
-void MockKnxdClient::disconnect() {
+
+void MockBusLink::disconnect() {
   connected_ = false;
   group_socket_open_ = false;
   while (!telegram_queue_.empty()) {
     telegram_queue_.pop();
   }
 }
-bool MockKnxdClient::reconnect() {
-  if (last_socket_path_.empty()) {
-    return false;
-  }
-  connected_ = connection_success_;
-  group_socket_open_ = connection_success_;  // auto-reopen
+
+bool MockBusLink::is_connected() const {
   return connected_;
 }
-bool MockKnxdClient::is_connected() const {
-  return connected_;
-}
-bool MockKnxdClient::open_group_socket(bool /*write_only*/) {
+
+bool MockBusLink::open_group_socket(bool /*write_only*/) {
   if (!connected_) {
     return false;
   }
   group_socket_open_ = connection_success_;
   return group_socket_open_;
 }
-bool MockKnxdClient::send_group_packet(uint16_t addr, const std::vector<uint8_t>& apdu) {
+
+bool MockBusLink::send_group_packet(uint16_t addr, const std::vector<uint8_t>& apdu) {
   if (!connected_ || !group_socket_open_) {
     return false;
   }
   if (send_fail_count_ > 0) {
     send_fail_count_--;
+    if (disconnect_on_send_failure_) {
+      connected_ = false;
+      group_socket_open_ = false;
+    }
     return false;
   }
   sent_packets_.push_back({addr, apdu});
   return true;
 }
-bool MockKnxdClient::poll_group_telegram(uint16_t& out_group_addr, std::vector<uint8_t>& out_apdu) {
+
+bool MockBusLink::poll_group_telegram(uint16_t& out_group_addr, std::vector<uint8_t>& out_apdu) {
   if (telegram_queue_.empty()) {
     return false;
   }
@@ -75,14 +81,18 @@ bool MockKnxdClient::poll_group_telegram(uint16_t& out_group_addr, std::vector<u
   telegram_count_++;
   return true;
 }
-int MockKnxdClient::get_fd() const {
+
+int MockBusLink::get_fd() const {
   return -1;
 }
-uint64_t MockKnxdClient::get_telegram_count() const {
+
+uint64_t MockBusLink::get_telegram_count() const {
   return telegram_count_;
 }
-void MockKnxdClient::set_nonblocking(bool /*enable*/) {}
-KnxdClient::WaitResult MockKnxdClient::wait_for_activity(int /*timeout_ms*/) {
+
+void MockBusLink::set_nonblocking(bool /*enable*/) {}
+
+BusLink::WaitResult MockBusLink::wait_for_activity(int /*timeout_ms*/) {
   wait_calls_++;
   if (!connected_) {
     return WaitResult::Error;
@@ -93,10 +103,12 @@ KnxdClient::WaitResult MockKnxdClient::wait_for_activity(int /*timeout_ms*/) {
   }
   return telegram_queue_.empty() ? WaitResult::Timeout : WaitResult::GroupData;
 }
-void MockKnxdClient::enqueue_telegram(uint16_t addr, const std::vector<uint8_t>& apdu) {
+
+void MockBusLink::enqueue_telegram(uint16_t addr, const std::vector<uint8_t>& apdu) {
   telegram_queue_.emplace(addr, apdu);
 }
-void MockKnxdClient::reset() {
+
+void MockBusLink::reset() {
   connected_ = false;
   group_socket_open_ = false;
   connection_success_ = true;
@@ -111,6 +123,8 @@ void MockKnxdClient::reset() {
   wait_error_count_ = 0;
   connect_calls_ = 0;
   wait_calls_ = 0;
+  min_send_interval_ms_ = 0;
+  disconnect_on_send_failure_ = false;
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

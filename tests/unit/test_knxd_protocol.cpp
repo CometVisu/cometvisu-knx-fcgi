@@ -17,7 +17,7 @@
 
 #include "knxd/knxd_protocol.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 // ---- Helpers for extracting bytes from knxd constants at compile time ----
 // These avoid hard-coding knxd message type values (like 0x0026) in tests.
@@ -25,11 +25,104 @@ using namespace cvknxd;
 // because the constants come from the knxd headers (<eibtypes.h>).
 
 namespace {
+using Bytes = std::vector<uint8_t>;
+
 constexpr uint8_t hi(uint16_t v) {
   return static_cast<uint8_t>((v >> 8) & 0xFF);
 }
 constexpr uint8_t lo(uint16_t v) {
   return static_cast<uint8_t>(v & 0xFF);
+}
+
+TEST(KnxdProtocolTest, RejectsMalformedGroupAddresses) {
+  EXPECT_FALSE(KnxGroupAddress::from_string("").has_value());
+  EXPECT_FALSE(KnxGroupAddress::from_string("1").has_value());
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/2").has_value());
+  EXPECT_FALSE(KnxGroupAddress::from_string("32/0/0").has_value());   // main > 31
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/8/0").has_value());    // middle > 7
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/2/256").has_value());  // sub > 255
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/2/3/4").has_value());  // trailing
+}
+
+TEST(KnxdProtocolTest, ParseApduRejectsShortInput) {
+  EXPECT_FALSE(parse_apdu(Bytes{0x00}).has_value());
+  EXPECT_FALSE(parse_apdu(Bytes{}).has_value());
+}
+
+TEST(KnxdProtocolTest, ParseEibdMessageRejectsShortAndTruncatedInput) {
+  uint16_t type = 0;
+  std::vector<uint8_t> data;
+  EXPECT_FALSE(parse_eibd_message({}, type, data));
+  EXPECT_FALSE(parse_eibd_message({0x00, 0x10, 0x00}, type, data));
+  // Length prefix announces more bytes than present.
+  EXPECT_FALSE(parse_eibd_message({0x00, 0x10, 0x26}, type, data));
+}
+
+TEST(KnxdProtocolTest, RejectsMalformedAddressComponents) {
+  EXPECT_FALSE(KnxGroupAddress::from_string("-1/2/3").has_value());  // no digits
+  EXPECT_FALSE(KnxGroupAddress::from_string("a/2/3").has_value());   // not a digit
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/").has_value());      // missing part
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/2/").has_value());    // missing part
+  EXPECT_FALSE(KnxGroupAddress::from_string("1x/2/3").has_value());  // wrong separator
+  EXPECT_FALSE(KnxGroupAddress::from_string("1/2x/3").has_value());  // wrong separator
+}
+
+TEST(KnxdProtocolTest, ParseApduHandlesEveryApciValue) {
+  // A_GroupValue_Read carries no data.
+  const auto read = parse_apdu(Bytes{0x00, 0x00});
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->type, ApduType::Read);
+  EXPECT_TRUE(read->data.empty());
+
+  // A_GroupValue_Response (APCI 1).
+  const auto response = parse_apdu(Bytes{0x00, 0x40});
+  ASSERT_TRUE(response.has_value());
+  EXPECT_EQ(response->type, ApduType::Response);
+
+  // A_GroupValue_Write (APCI 2).
+  const auto write = parse_apdu(Bytes{0x00, 0x80});
+  ASSERT_TRUE(write.has_value());
+  EXPECT_EQ(write->type, ApduType::Write);
+
+  // APCI 3 (0xC0 in the second octet) is not a group value service: the
+  // standard has only three, so the frame is rejected instead of being
+  // reported as an unknown type with no data.
+  EXPECT_FALSE(parse_apdu(Bytes{0x00, 0xC0}).has_value());
+}
+
+TEST(KnxdProtocolTest, ParseApduRejectsNonGroupValueServices) {
+  // Individual-address / device-descriptor services carry the APCI in the low
+  // bits of the first octet as well; none of them is a group value.
+  EXPECT_FALSE(parse_apdu(Bytes{0x01, 0x00}).has_value());  // APCI 4 (individual address read)
+  EXPECT_FALSE(parse_apdu(Bytes{0x02, 0x00}).has_value());  // APCI 8
+  EXPECT_FALSE(parse_apdu(Bytes{0x03, 0x80}).has_value());  // APCI 14
+  // Connection-oriented TPCI (bits 7..6 = 01/10/11) is never a group value.
+  EXPECT_FALSE(parse_apdu(Bytes{0x40, 0x80}).has_value());
+  EXPECT_FALSE(parse_apdu(Bytes{0x80, 0x80}).has_value());
+  EXPECT_FALSE(parse_apdu(Bytes{0xC0, 0x80}).has_value());
+}
+
+TEST(KnxdProtocolTest, ParseApduDecodesTheSplitApci) {
+  // APCI bits 1..0 live in octet 1: 0x01 -> APCI 4..7, never a group value.
+  // APCI 2 = 0b0010 -> high bits 0b00 in octet 1, low bits 0b10 in octet 2.
+  const auto write = parse_apdu(Bytes{0x00, 0x80, 0x42});
+  ASSERT_TRUE(write.has_value());
+  EXPECT_EQ(write->type, ApduType::Write);
+}
+
+TEST(KnxdProtocolTest, ParseEibdMessageRejectsATooShortPayload) {
+  uint16_t type = 0;
+  std::vector<uint8_t> data;
+  // A payload length below the 2-byte type would invert the data range.
+  EXPECT_FALSE(parse_eibd_message(Bytes{0x00, 0x00, 0x00, 0x26}, type, data));
+  EXPECT_FALSE(parse_eibd_message(Bytes{0x00, 0x01, 0x00, 0x26}, type, data));
+}
+
+TEST(KnxdProtocolTest, ParseEibdMessageRejectsLengthOverrun) {
+  uint16_t type = 0;
+  std::vector<uint8_t> data;
+  // Announces a 16 byte payload but carries none of it.
+  EXPECT_FALSE(parse_eibd_message({0x00, 0x10, 0x26, 0x00}, type, data));
 }
 }  // namespace
 
@@ -161,44 +254,40 @@ TEST(ApduTest, BuildResponseOneByte) {
 }
 
 TEST(ApduTest, ParseWriteOneByte) {
-  // Single-byte write: type bits 0x80, data in lower 6 bits
-  std::vector<uint8_t> apdu = {0x00, 0x80 | (0x2A & 0x3F)};
-  ApduType type = ApduType::Write;
-  std::vector<uint8_t> data;
-  ASSERT_TRUE(parse_apdu(apdu, type, data));
-  EXPECT_EQ(type, ApduType::Write);
-  ASSERT_EQ(data.size(), 1);
-  EXPECT_EQ(data[0], 0x2A);
+  // Single-byte write: APCI 2, data in the lower 6 bits of octet 2.
+  std::vector<uint8_t> apdu = {0x00, static_cast<uint8_t>(0x80 | (0x2A & 0x3F))};
+  const auto parsed = parse_apdu(apdu);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->type, ApduType::Write);
+  ASSERT_EQ(parsed->data.size(), 1);
+  EXPECT_EQ(parsed->data[0], 0x2A);
 }
 
 TEST(ApduTest, ParseWriteMultiByte) {
   std::vector<uint8_t> apdu = {0x00, 0x80, 0x0C, 0x6F};
-  ApduType type = ApduType::Write;
-  std::vector<uint8_t> data;
-  ASSERT_TRUE(parse_apdu(apdu, type, data));
-  EXPECT_EQ(type, ApduType::Write);
-  ASSERT_EQ(data.size(), 2);
-  EXPECT_EQ(data[0], 0x0C);
-  EXPECT_EQ(data[1], 0x6F);
+  const auto parsed = parse_apdu(apdu);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->type, ApduType::Write);
+  ASSERT_EQ(parsed->data.size(), 2);
+  EXPECT_EQ(parsed->data[0], 0x0C);
+  EXPECT_EQ(parsed->data[1], 0x6F);
 }
 
 TEST(ApduTest, ParseRead) {
   std::vector<uint8_t> apdu = {0x00, 0x00};
-  ApduType type = ApduType::Write;
-  std::vector<uint8_t> data;
-  ASSERT_TRUE(parse_apdu(apdu, type, data));
-  EXPECT_EQ(type, ApduType::Read);
-  EXPECT_TRUE(data.empty());
+  const auto parsed = parse_apdu(apdu);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->type, ApduType::Read);
+  EXPECT_TRUE(parsed->data.empty());
 }
 
 TEST(ApduTest, ParseResponse) {
-  std::vector<uint8_t> apdu = {0x00, 0x40 | (0x1A & 0x3F)};
-  ApduType type = ApduType::Write;
-  std::vector<uint8_t> data;
-  ASSERT_TRUE(parse_apdu(apdu, type, data));
-  EXPECT_EQ(type, ApduType::Response);
-  ASSERT_EQ(data.size(), 1);
-  EXPECT_EQ(data[0], 0x1A);
+  std::vector<uint8_t> apdu = {0x00, static_cast<uint8_t>(0x40 | (0x1A & 0x3F))};
+  const auto parsed = parse_apdu(apdu);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->type, ApduType::Response);
+  ASSERT_EQ(parsed->data.size(), 1);
+  EXPECT_EQ(parsed->data[0], 0x1A);
 }
 
 // ---- EIBD Wire Format: Type-Specific Builders ----

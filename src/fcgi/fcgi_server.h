@@ -13,20 +13,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#ifndef COMETVISU_KNXD_FCGI_FCGI_SERVER_H_
-#define COMETVISU_KNXD_FCGI_FCGI_SERVER_H_
+#pragma once
 
 /**
  * @file fcgi_server.h
  * @brief FastCGI server — accept loop, request parsing, and response writing.
  *
- * Wraps the libfcgi library (both the high-level FCGI_stdio API used in
- * spawn-fcgi mode and the lower-level FCGX API used in direct-socket mode).
- *
- * The original eibread-cgi / eibwrite-cgi reference implementations used the
- * simpler FCGI_stdio API exclusively and ran under spawn-fcgi.  This class
- * extends that model with a direct-socket mode that supports a fork-based
- * worker pool without requiring spawn-fcgi.
+ * Wraps the libfcgi FCGX API.  The server always owns a listen socket
+ * (FCGI_SOCKET: a Unix path or a TCP port); serving FastCGI from stdin/stdout
+ * (the classic spawn-fcgi model) is not supported any more — the fork-based
+ * worker pool and the single bus owner (cache reader) require an inherited
+ * listen fd.
  */
 
 #include <fcgiapp.h>
@@ -38,7 +35,7 @@
 
 #include "fcgi_request.h"
 
-namespace cvknxd {
+namespace cvknx {
 
 /// Callback type for request handlers.
 /// Takes a parsed request and returns the response.
@@ -49,19 +46,13 @@ using RequestHandler = std::function<FcgiResponse(const FcgiRequest&)>;
  *
  * Uses the libfcgi library for the FCGI protocol implementation.
  *
- * Supports two operating modes:
- *   1. **Spawn-fcgi mode** (default): reads/writes FCGI on stdin/stdout as
- *      configured by spawn-fcgi or a web server.  Concurrency is achieved by
- *      running multiple process instances via spawn-fcgi's `-F` flag.
- *      This is the mode used by the reference eibread-cgi / eibwrite-cgi.
- *   2. **Direct socket mode**: call listen() to open a TCP or Unix socket,
- *      then run() to accept connections.  For concurrent clients, main.cpp
- *      uses a fork-based worker pool — each child process calls run() on the
- *      inherited listen fd.
+ * Call listen() to open a TCP or Unix socket, then run() to accept
+ * connections.  For concurrent clients, main.cpp uses a fork-based worker
+ * pool — each child process calls run() on the inherited listen fd.
  *
- * @note In direct socket mode, FCGX_Init() must be called before
- *       FCGX_Accept_r().  FCGX_InitRequest() alone does not set the
- *       libInitialized flag, causing FCGX_Accept_r() to return -9998.
+ * @note FCGX_Init() must be called before FCGX_Accept_r().  FCGX_InitRequest()
+ *       alone does not set the libInitialized flag, causing FCGX_Accept_r() to
+ *       return -9998.
  */
 class FcgiServer {
 public:
@@ -85,7 +76,8 @@ public:
   /// be served by workers that finish quickly.
   ///
   /// @param sem Pointer to a sem_t in shared memory (MAP_SHARED).  Must be
-  ///            initialized to the number of workers before forking.
+  ///            initialized before forking, to the number of long-polls the
+  ///            pool may serve (workers minus the short-request reserve).
   void set_load_shed_semaphore(sem_t* sem);
 
   /// @brief Set a shared semaphore for general request concurrency limiting.
@@ -100,14 +92,14 @@ public:
   /// failed operation.
   ///
   /// @param sem Pointer to a sem_t in shared memory (MAP_SHARED).  Must be
-  ///            initialized to a safe concurrency limit (typically equal to
-  ///            the worker count).
+  ///            initialized before forking to the same long-poll capacity as
+  ///            the load-shed semaphore (see longpoll_capacity() in main.cpp).
   void set_concurrency_semaphore(sem_t* sem);
 
   /// @brief Open a TCP or Unix socket for direct FCGI connections.
   ///
-  /// Once opened, the socket is automatically used by run() alongside the
-  /// standard FCGI stdin/stdout stream.
+  /// The listen fd is what makes the fork-based pool work: every worker
+  /// inherits it, and the OS serialises the accept() calls across processes.
   ///
   /// @param socket_path Either ":port" for TCP (e.g. ":9000") or a
   ///                    filesystem path for a Unix domain socket.
@@ -155,22 +147,19 @@ private:
   /// the semaphore capacity the worker held.
   [[nodiscard]] FcgiResponse invoke_handler(const FcgiRequest& request);
 
-  /// Read all FCGI parameters from stdin into an FcgiRequest.
-  /// Uses getenv() which reads from the global environ pointer.
-  [[nodiscard]] static FcgiRequest read_request();
-
   /// Read FCGI parameters from an explicit FCGI parameter array into an
   /// FcgiRequest.  Thread-safe: uses the passed envp directly instead of
   /// the global environ pointer, avoiding races when multiple threads
   /// would overwrite environ concurrently.
+  ///
+  /// Not static: the request body is read from this request's FCGX stdin
+  /// stream (`request_.in`), which belongs to the connection being served.
+  ///
   /// @param envp  FCGI parameter array (FCGX_Request::envp).
-  [[nodiscard]] static FcgiRequest read_request(char** envp);
+  [[nodiscard]] FcgiRequest read_request(char** envp);
 
-  /// Write an FcgiResponse to the appropriate output stream.
-  /// Uses FCGX_Request::out when in direct socket mode, FCGI stdout otherwise.
+  /// Write an FcgiResponse to the connection's FCGX output stream.
   void write_response(const FcgiResponse& response);
 };
 
-}  // namespace cvknxd
-
-#endif  // COMETVISU_KNXD_FCGI_FCGI_SERVER_H_
+}  // namespace cvknx

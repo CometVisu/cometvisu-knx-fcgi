@@ -32,13 +32,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "bus/bus_link.h"
+#include "bus/cache_reader.h"
+#include "bus/shared_tx_bus_link.h"
 #include "fcgi/fcgi_server.h"
+#include "router/router.h"
+#include "state/session_store.h"
+#include "state/shared_group_cache.h"
+#include "state/shared_tx_queue.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 namespace {
 
@@ -75,7 +83,7 @@ bool sockets_available() {
   if (s < 0) {
     return false;
   }
-  struct sockaddr_un addr{};
+  struct sockaddr_un addr {};
   addr.sun_family = AF_UNIX;
   size_t path_len = path.copy(addr.sun_path, sizeof(addr.sun_path) - 1);
   addr.sun_path[path_len] = '\0';
@@ -224,7 +232,7 @@ public:
 
     // Set a receive timeout to prevent test hangs in CI.
     // If the server doesn't respond within 5 seconds, read_response() fails.
-    struct timeval tv{};
+    struct timeval tv {};
     tv.tv_sec = 5;
     if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
       close(fd_);
@@ -232,7 +240,7 @@ public:
       return false;
     }
 
-    struct sockaddr_un addr{};
+    struct sockaddr_un addr {};
     addr.sun_family = AF_UNIX;
     size_t path_len = socket_path.copy(addr.sun_path, sizeof(addr.sun_path) - 1);
     addr.sun_path[path_len] = '\0';
@@ -397,6 +405,9 @@ std::vector<pid_t> fork_workers(int num_workers, FcgiServer& server) {
 /// @return The response body, or empty string if all attempts failed.
 std::string fcgi_retry_transaction(const std::string& socket_path, const std::string& query_string,
                                    uint16_t request_id, int max_attempts = 30) {
+  // A read needs a session id (anonymous session "0").
+  const std::string query =
+      query_string.find("s=") == std::string::npos ? query_string + "&s=0" : query_string;
   int delay_ms = 10;
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     FcgiTestClient client;
@@ -407,7 +418,7 @@ std::string fcgi_retry_transaction(const std::string& socket_path, const std::st
       }
       continue;
     }
-    if (!client.send_get_request(request_id, query_string, "/r")) {
+    if (!client.send_get_request(request_id, query, "/r")) {
       std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
       if (delay_ms < 500) {
         delay_ms *= 2;
@@ -536,8 +547,8 @@ TEST_F(ConcurrentClientsTest, MultipleClientsProcessedConcurrently) {
 // TDD regression test 1: environ race between worker threads.
 //
 // The original bug: all worker threads set the global `environ` pointer
-// (environ = request.envp), then read_request() called getenv() which
-// reads from environ.  Thread A could accept client A, but before reading
+// (environ = request.envp), then the request reader called getenv() — which
+// read from environ.  Thread A could accept client A, but before reading
 // its parameters, Thread B accepted client B and overwrote environ.
 // Thread A then read Thread B's parameters — silent data corruption.
 //
@@ -690,6 +701,302 @@ TEST_F(ConcurrentClientsTest, ManyConcurrentClientsStressTest) {
     }
   }
   ::munmap(shared, sizeof(SharedState));
+}
+
+// ============================================================
+// Concurrent writes through the shared TX queue (real multi-process path)
+// ============================================================
+
+/// A bus that records telegrams and answers slowly (rate limited).
+class DelayedRecordingLink : public BusLink {
+public:
+  explicit DelayedRecordingLink(int delay_us) : delay_us_(delay_us) {}
+
+  [[nodiscard]] bool connect() override { return true; }
+  void disconnect() override {}
+  [[nodiscard]] bool is_connected() const override { return true; }
+
+  [[nodiscard]] bool send_group_packet(std::uint16_t group_addr,
+                                       const std::vector<std::uint8_t>& apdu) override {
+    if (delay_us_ > 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(delay_us_));
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    sent_.emplace_back(group_addr, apdu);
+    return true;
+  }
+
+  [[nodiscard]] bool poll_group_telegram(std::uint16_t& out_group_addr,
+                                         std::vector<std::uint8_t>& out_apdu) override {
+    (void)out_group_addr;
+    (void)out_apdu;
+    return false;
+  }
+  [[nodiscard]] int get_fd() const override { return -1; }
+  [[nodiscard]] std::uint64_t get_telegram_count() const override { return 0; }
+  void set_nonblocking(bool enable) override { (void)enable; }
+  [[nodiscard]] WaitResult wait_for_activity(int timeout_ms) override {
+    std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+    return WaitResult::Timeout;
+  }
+  [[nodiscard]] std::string label() const override { return "delayed recording bus"; }
+
+  [[nodiscard]] std::size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sent_.size();
+  }
+  [[nodiscard]] std::vector<std::pair<std::uint16_t, std::vector<std::uint8_t>>> sent() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sent_;
+  }
+
+private:
+  int delay_us_ = 0;
+  mutable std::mutex mutex_;
+  std::vector<std::pair<std::uint16_t, std::vector<std::uint8_t>>> sent_;
+};
+
+/// One FCGI request on its own connection.
+bool fcgi_one_shot(const std::string& socket_path, const std::string& path,
+                   const std::string& query, std::uint16_t request_id, std::string& body) {
+  FcgiTestClient client;
+  if (!client.connect(socket_path)) {
+    return false;
+  }
+  // The protocol requires a session id on /r and /w; the anonymous session is
+  // "0".  A test that wants an invalid session supplies its own.
+  std::string q = query;
+  if ((path == "/r" || path == "/w") && q.find("s=") == std::string::npos) {
+    q += q.empty() ? "s=0" : "&s=0";
+  }
+  if (!client.send_get_request(request_id, q, path)) {
+    return false;
+  }
+  body = client.read_response(request_id);
+  return true;
+}
+
+/// Test: many clients, many workers, one bus owner.
+///
+/// Every accepted `/w` must reach the bus exactly once and intact, even though
+/// the request is handled in a forked worker while the single bus connection
+/// lives in another process and the bus itself is slow.
+TEST_F(ConcurrentClientsTest, ConcurrentWritesReachTheBusExactlyOnce) {
+  constexpr int kWorkers = 4;
+  constexpr int kClients = 8;
+  constexpr int kPerClient = 5;
+
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  SharedTxBusLink worker_link(queue, cache);
+  SessionStore sessions;
+  Router router(worker_link, cache, sessions, /*longpoll_timeout_sec=*/1, "", "bus");
+
+  DelayedRecordingLink bus(/*delay_us=*/1000);  // a slow bus: 1 ms per telegram
+  CacheReaderOptions reader_options;
+  reader_options.wait_timeout_ms = 5;
+  reader_options.reconnect_backoff_ms = 20;
+  reader_options.max_reconnect_backoff_ms = 40;
+  reader_options.sleep_slice_ms = 2;
+  reader_options.max_tx_per_sec = 0;  // these tests assert throughput
+
+  std::atomic<bool> stop{false};
+  std::thread reader([&] {
+    run_cache_reader(bus, cache, &queue, reader_options, [&stop] { return stop.load(); });
+  });
+
+  // Wait until the reader published "available": before that, writes are
+  // rejected by design (a write during an outage must not pretend success).
+  const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!cache.bus_status().available && std::chrono::steady_clock::now() < ready_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_TRUE(cache.bus_status().available) << "cache reader never reported an available bus";
+
+  FcgiServer server;
+  ASSERT_TRUE(server.listen(socket_path_));
+  server.set_handler(
+      [&router](const FcgiRequest& req) -> FcgiResponse { return router.route(req); });
+
+  const auto workers = fork_workers(kWorkers, server);
+  ASSERT_EQ(workers.size(), static_cast<std::size_t>(kWorkers));
+
+  std::vector<std::thread> clients;
+  std::atomic<int> rejected{0};
+  std::atomic<int> connected{0};
+  for (int c = 0; c < kClients; ++c) {
+    clients.emplace_back([&, c] {
+      for (int i = 0; i < kPerClient; ++i) {
+        char value[8] = {};
+        std::snprintf(value, sizeof(value), "80%02x", i & 0xFF);
+        const int index = (c * kPerClient) + i;
+        const std::string query = "a=1/2/" + std::to_string(index) + "&v=" + value;
+        std::string body;
+        if (!fcgi_one_shot(socket_path_, "/w", query, static_cast<std::uint16_t>(index + 1),
+                           body)) {
+          continue;
+        }
+        ++connected;
+        // The FCGI STDOUT includes the HTTP headers; a failed write carries the
+        // JSON error body, a successful one has none.
+        if (body.find("\"error\"") != std::string::npos) {
+          ++rejected;
+        }
+      }
+    });
+  }
+  for (auto& client : clients) {
+    client.join();
+  }
+
+  const std::size_t expected = static_cast<std::size_t>(kClients * kPerClient);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (bus.size() < expected && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  stop = true;
+  reader.join();
+  kill_workers(workers);
+
+  EXPECT_EQ(rejected.load(), 0) << "no write may fail while the bus is up";
+  EXPECT_EQ(connected.load(), static_cast<int>(expected)) << "clients could not complete";
+
+  const auto sent = bus.sent();
+  ASSERT_EQ(sent.size(), expected) << "lost or duplicated telegrams";
+
+  std::set<std::uint16_t> addresses;
+  for (const auto& [addr, apdu] : sent) {
+    EXPECT_TRUE(addresses.insert(addr).second) << "duplicate telegram for " << addr;
+    ASSERT_EQ(apdu.size(), 3U);
+    EXPECT_EQ(apdu.front(), 0x00);
+    EXPECT_EQ(apdu.at(1) & 0xC0, 0x80) << "not a group value write";
+  }
+  EXPECT_EQ(addresses.size(), expected);
+}
+
+/// Test: while the bus is unreachable every write is rejected (never queued as
+/// if it had succeeded), and `/r` reports the outage with the transport's key.
+TEST_F(ConcurrentClientsTest, WritesDuringOutageAreRejectedAndNotQueued) {
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+  SharedTxBusLink worker_link(queue, cache);
+  SessionStore sessions;
+
+  // No cache reader: the bus is unavailable (the shared state starts as
+  // "available", so the outage has to be published explicitly).
+  cache.publish_bus_status(false);
+  Router router(worker_link, cache, sessions, /*longpoll_timeout_sec=*/1, "", "bus");
+
+  FcgiServer server;
+  ASSERT_TRUE(server.listen(socket_path_));
+  server.set_handler(
+      [&router](const FcgiRequest& req) -> FcgiResponse { return router.route(req); });
+  const auto workers = fork_workers(2, server);
+  ASSERT_EQ(workers.size(), 2U);
+
+  std::string write_body;
+  ASSERT_TRUE(fcgi_one_shot(socket_path_, "/w", "a=1/2/3&v=8042", 1, write_body));
+  EXPECT_NE(write_body.find("\"error\""), std::string::npos)
+      << "a write during an outage must fail";
+  EXPECT_NE(write_body.find("write failed"), std::string::npos);
+
+  std::string read_body;
+  ASSERT_TRUE(fcgi_one_shot(socket_path_, "/r", "a=1/2/3", 2, read_body));
+  EXPECT_NE(read_body.find("\"bus\""), std::string::npos)
+      << "the outage key must be 'bus' for the KNXnet/IP transports";
+
+  // Nothing may have been queued: a rejected write must not be delivered later.
+  EXPECT_EQ(queue.size(), 0U);
+
+  kill_workers(workers);
+}
+
+/// Test: blocked long-polls must not delay writes.
+///
+/// This is the reason for the worker pool: `/r` can block for the whole
+/// long-poll timeout, so a `/w` arriving at the same moment has to be served by
+/// another worker immediately.
+TEST_F(ConcurrentClientsTest, LongPollsDoNotDelayWrites) {
+  constexpr int kWorkers = 6;
+  constexpr int kLongPolls = 4;
+
+  SharedGroupCache cache;
+  ASSERT_TRUE(cache.create());
+  SharedTxQueue queue;
+  ASSERT_TRUE(queue.create());
+
+  SharedTxBusLink worker_link(queue, cache);
+  SessionStore sessions;
+  Router router(worker_link, cache, sessions, /*longpoll_timeout_sec=*/1, "", "bus");
+
+  DelayedRecordingLink bus(/*delay_us=*/0);
+  CacheReaderOptions reader_options;
+  reader_options.wait_timeout_ms = 5;
+  reader_options.reconnect_backoff_ms = 20;
+  reader_options.max_reconnect_backoff_ms = 40;
+  reader_options.sleep_slice_ms = 2;
+  reader_options.max_tx_per_sec = 0;  // these tests assert throughput
+  std::atomic<bool> stop{false};
+  std::thread reader([&] {
+    run_cache_reader(bus, cache, &queue, reader_options, [&stop] { return stop.load(); });
+  });
+  const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!cache.bus_status().available && std::chrono::steady_clock::now() < ready_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_TRUE(cache.bus_status().available);
+
+  FcgiServer server;
+  ASSERT_TRUE(server.listen(socket_path_));
+  server.set_handler(
+      [&router](const FcgiRequest& req) -> FcgiResponse { return router.route(req); });
+  const auto workers = fork_workers(kWorkers, server);
+  ASSERT_EQ(workers.size(), static_cast<std::size_t>(kWorkers));
+
+  // Occupy most of the pool with long-polls (no `t` parameter → long-poll).
+  std::vector<std::thread> pollers;
+  std::atomic<int> polls_done{0};
+  for (int i = 0; i < kLongPolls; ++i) {
+    pollers.emplace_back([&, i] {
+      std::string body;
+      if (fcgi_one_shot(socket_path_, "/r", "a=1/2/" + std::to_string(i),
+                        static_cast<std::uint16_t>(100 + i), body)) {
+        ++polls_done;
+      }
+    });
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // let them block
+
+  std::vector<long> latencies_ms;
+  for (int i = 0; i < 5; ++i) {
+    const auto start = std::chrono::steady_clock::now();
+    std::string body;
+    ASSERT_TRUE(fcgi_one_shot(socket_path_, "/w", "a=1/2/3&v=8042",
+                              static_cast<std::uint16_t>(200 + i), body));
+    latencies_ms.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count());
+    EXPECT_EQ(body.find("\"error\""), std::string::npos);
+  }
+  for (auto& poller : pollers) {
+    poller.join();
+  }
+
+  EXPECT_EQ(polls_done.load(), kLongPolls) << "long-polls must complete on their own timeout";
+  for (std::size_t i = 0; i < latencies_ms.size(); ++i) {
+    EXPECT_LT(latencies_ms[i], 500) << "write " << i << " was delayed by a long-poll";
+  }
+  EXPECT_EQ(bus.size(), 5U);
+
+  stop = true;
+  reader.join();
+  kill_workers(workers);
 }
 
 }  // namespace

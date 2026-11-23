@@ -35,7 +35,7 @@
 #include "handlers/write_handler.h"
 #include "state/shared_group_cache.h"
 
-namespace cvknxd {
+namespace cvknx {
 
 /**
  * @brief URL router: dispatches FCGI requests to the appropriate handler.
@@ -45,8 +45,9 @@ namespace cvknxd {
  */
 class Router {
 public:
-  Router(KnxdClientInterface& knxd, SharedGroupCache& cache, SessionStore& sessions,
-         int longpoll_timeout_sec = 300, std::string base_url = "");
+  Router(BusLink& knxd, SharedGroupCache& cache, SessionStore& sessions,
+         int longpoll_timeout_sec = 300, std::string base_url = "",
+         std::string outage_key = "knxd");
 
   /// @brief Dispatch a request and return the response.
   /// @param request The parsed FCGI request.
@@ -59,4 +60,4 @@ private:
   WriteHandler write_handler_;
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

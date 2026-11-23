@@ -27,7 +27,7 @@
  * or protocol logic — that lives in FcgiServer.
  */
 
-namespace cvknxd {
+namespace cvknx {
 
 /**
  * @brief Parsed FastCGI request parameters.
@@ -69,4 +69,4 @@ struct FcgiResponse {
   std::string body;
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

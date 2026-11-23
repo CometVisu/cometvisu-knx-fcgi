@@ -29,10 +29,11 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <ostream>
 #include <string_view>
 
-namespace cvknxd {
+namespace cvknx {
 
 /**
  * @brief Debug logging facility.
@@ -44,6 +45,9 @@ namespace cvknxd {
  */
 class DebugLog {
 public:
+  /// Severity of a log line (AGENTS.md: `[LEVEL] [timestamp] message`).
+  enum class Level : std::uint8_t { Info, Warn, Error };
+
   /// Initialize from environment variable `DEBUG_BACKEND`.
   static void init_from_env();
 
@@ -85,6 +89,14 @@ public:
   static void knxd_recv(std::string_view operation, std::string_view address,
                         std::string_view data);
 
+  /// Log one operational line: `[LEVEL] [timestamp] message`.
+  ///
+  /// Operational messages are always written (unlike the DEBUG_BACKEND
+  /// traces) — a lost bus connection must be visible in the journal.
+  /// @param level Severity shown as `INFO`, `WARN` or `ERROR`.
+  /// @param message Complete, single-line message (already formatted).
+  static void log(Level level, std::string_view message);
+
 private:
   static bool enabled_;
   static size_t max_uri_length_;
@@ -98,4 +110,4 @@ private:
   static bool write_truncated(std::ostream& os, std::string_view text, size_t max_len);
 };
 
-}  // namespace cvknxd
+}  // namespace cvknx

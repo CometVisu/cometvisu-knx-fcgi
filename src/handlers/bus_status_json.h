@@ -14,45 +14,50 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /**
- * @file knxd_status_json.h
- * @brief Report a knxd outage to the client in /r and /w responses.
+ * @file bus_status_json.h
+ * @brief Report a bus outage to the client in /r and /w responses.
  *
- * The cache keeps serving the last known values while knxd is unreachable, so
- * /r looks perfectly healthy — the client would never notice that the values
- * stopped updating.  Whenever the cache reader has no knxd connection, /r and
- * /w add an additional object to the response:
+ * The cache keeps serving the last known values while the bus connection is
+ * unreachable, so /r looks perfectly healthy — the client would never notice
+ * that the values stopped updating.  Whenever the cache reader has no bus
+ * connection, /r and /w add an additional object to the response:
  *
  * @code
  *   {"d":{...},"i":42,"knxd":{"ok":false,"since":1763000000,"lastOk":1762990000}}
+ *   {"d":{...},"i":42,"bus":{"ok":false,"since":1763000000,"lastOk":1762990000}}
  * @endcode
  *
- * - `ok` is always `false` in this block (its presence already means "knxd is
- *   not available"; the field makes that explicit for the client).
+ * The key is `"knxd"` for the knxd transport (unchanged for existing
+ * deployments) and `"bus"` for the KNXnet/IP transports; it comes from
+ * BusConfig::outage_key().  The inner shape is identical.
+ *
+ * - `ok` is always `false` in this block (its presence already means "not
+ *   available"; the field makes that explicit for the client).
  * - `since` is the Unix time (seconds) at which the current outage started.
  * - `lastOk` is the Unix time (seconds) of the last successful connection.
  * Both timestamps are omitted if unknown (never connected / not yet recorded).
  */
 
-#ifndef COMETVISU_KNXD_FCGI_KNXD_STATUS_JSON_H_
-#define COMETVISU_KNXD_FCGI_KNXD_STATUS_JSON_H_
+#pragma once
+
+#include <string_view>
 
 #include "state/shared_group_cache.h"
 
-namespace cvknxd {
+namespace cvknx {
 
 class JsonBuilder;
 
-/// Append `"knxd":{"ok":false,...}` when knxd is unavailable.
+/// Append `"<key>":{"ok":false,...}` when the bus link is unavailable.
 ///
 /// @param json              Builder positioned inside the response object.
 /// @param status            State published by the cache reader.
+/// @param key               `"knxd"` or `"bus"` (BusConfig::outage_key()).
 /// @param force_unavailable Report the outage even if @p status still says the
 ///                          connection is up (used by /w after a failed send,
-///                          where the write itself proves knxd is not there).
+///                          where the write itself proves the link is gone).
 /// @return true if the block was appended.
-bool add_knxd_outage(JsonBuilder& json, const SharedGroupCache::KnxdStatus& status,
-                     bool force_unavailable = false);
+bool add_bus_outage(JsonBuilder& json, const SharedGroupCache::BusStatus& status,
+                    std::string_view key, bool force_unavailable = false);
 
-}  // namespace cvknxd
-
-#endif  // COMETVISU_KNXD_FCGI_KNXD_STATUS_JSON_H_
+}  // namespace cvknx

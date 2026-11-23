@@ -13,9 +13,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-add_library(cvknxd_mocks STATIC
-    mock_knxd_socket.cpp
+add_library(cvknx_mocks STATIC
+    mock_bus_link.cpp
 )
 
-target_include_directories(cvknxd_mocks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(cvknxd_mocks PUBLIC cvknxd_knxd cvknxd_util)
+target_include_directories(cvknx_mocks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(cvknx_mocks PUBLIC cvknx_knxd cvknx_util)

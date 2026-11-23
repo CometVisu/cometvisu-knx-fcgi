@@ -1,6 +1,6 @@
 # Build
 build/
-build-rel/
+build-*/
 cmake-build-*/
 
 # IDE
@@ -18,6 +18,10 @@ cmake-build-*/
 *.so
 *.dylib
 
+# Python (helper scripts under tools/)
+__pycache__/
+*.py[cod]
+
 # Test
 Testing/
 CTestTestfile.cmake
@@ -26,3 +30,5 @@ CTestTestfile.cmake
 .DS_Store
 *.log
 .cache
+coverage-report.txt
+coverage-gaps.txt

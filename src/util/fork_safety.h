@@ -20,7 +20,7 @@
 
 #pragma once
 
-namespace cvknxd {
+namespace cvknx {
 
 /// Flush all buffered output streams before forking.
 ///
@@ -32,4 +32,4 @@ namespace cvknxd {
 /// Call this immediately before every fork() of a process that logs.
 void flush_before_fork();
 
-}  // namespace cvknxd
+}  // namespace cvknx

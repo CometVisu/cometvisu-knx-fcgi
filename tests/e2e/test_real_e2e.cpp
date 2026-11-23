@@ -29,7 +29,7 @@
 #include "state/session_store.h"
 #include "state/shared_group_cache.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 /// Real E2E tests against a running knxd instance.
 ///
@@ -72,9 +72,15 @@ protected:
   /// FcgiRequest fields: method, uri, query, ctype, content, script, path_info, proto
   static FcgiRequest req(const std::string& method, const std::string& path,
                          const std::string& query = "") {
+    // The protocol requires a session id on /r and /w (anonymous session "0").
+    // A test that asserts what an invalid session does supplies its own `s=`.
+    std::string q = query;
+    if ((path == "/r" || path == "/w") && q.find("s=") == std::string::npos) {
+      q += q.empty() ? "s=0" : "&s=0";
+    }
     return FcgiRequest{.request_method = method,
                        .request_uri = "",
-                       .query_string = query,
+                       .query_string = q,
                        .content_type = "",
                        .content = "",
                        .script_name = "",
@@ -1010,7 +1016,7 @@ TEST_F(RealKnxdE2ETest, IndexNeverGoesBackwardSequentialReads) {
 
 /// Two concurrent readers sharing a single KnxdClient (via Router) must
 /// never see backward i values.  This simulates the fork-based worker pool
-/// where all workers share one knxd connection (spawn-fcgi mode).
+/// where all workers share the one bus connection.
 TEST_F(RealKnxdE2ETest, IndexNeverGoesBackwardConcurrentReaders) {
   SessionStore sessions_a;
   SessionStore sessions_b;

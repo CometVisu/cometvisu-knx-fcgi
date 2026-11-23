@@ -18,12 +18,12 @@
 #include <thread>
 
 #include "handlers/read_handler.h"
-#include "mock_knxd_socket.h"
+#include "mock_bus_link.h"
 #include "state/session_store.h"
 #include "state/shared_group_cache.h"
 #include "util/query_string.h"
 
-using namespace cvknxd;
+using namespace cvknx;
 
 class ReadHandlerTest : public ::testing::Test {
 public:
@@ -33,7 +33,7 @@ public:
     (void)knxd_.open_group_socket(false);
   }
 
-  MockKnxdClient knxd_;  // NOLINT
+  MockBusLink knxd_;  // NOLINT
   SharedGroupCache cache_;
   SessionStore sessions_;
 };
@@ -44,14 +44,23 @@ public:
 
 TEST_F(ReadHandlerTest, NoAddressesReturns400) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("s=abc&t=0");
+  auto r = handler.handle("s=0&t=0");
   EXPECT_EQ(r.http_status, 400);
   EXPECT_NE(r.body.find("\"error\":\"missing address\""), std::string::npos);
 }
 
+// The protocol requires `s` on every request: serving values to a client that
+// never logged in would make the session parameter pointless.
+TEST_F(ReadHandlerTest, MissingSessionReturns401) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("a=1/2/3&t=0");
+  EXPECT_EQ(r.http_status, 401);
+  EXPECT_NE(r.body.find("\"error\":\"missing session\""), std::string::npos);
+}
+
 TEST_F(ReadHandlerTest, InvalidTimeoutReturns400) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=abc");
+  auto r = handler.handle("s=0&a=1/2/3&t=abc");
   EXPECT_EQ(r.http_status, 400);
 }
 
@@ -77,7 +86,7 @@ TEST_F(ReadHandlerTest, ValidSessionProceeds) {
 
 TEST_F(ReadHandlerTest, NoValidAddressesReturns404) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=invalid");
+  auto r = handler.handle("s=0&a=invalid");
   EXPECT_EQ(r.http_status, 404);
 }
 
@@ -85,7 +94,7 @@ TEST_F(ReadHandlerTest, NoValidAddressesReturns404) {
 // exceeding the address limit must be reported instead of silently dropping
 // addresses (which left those tiles without any value forever).
 TEST_F(ReadHandlerTest, TooManyAddressesReturns400) {
-  std::string q = "t=0";
+  std::string q = "s=0&t=0";
   for (size_t i = 0; i < QueryString::kMaxValuesPerKey + 10; ++i) {
     q += "&a=1/2/3";
   }
@@ -101,7 +110,7 @@ TEST_F(ReadHandlerTest, TooManyAddressesReturns400) {
 // all addresses have to be parsed and the last one has to be delivered.
 TEST_F(ReadHandlerTest, SixHundredAddressesAreAllServed) {
   constexpr int kAddresses = 600;
-  std::string q = "t=0";
+  std::string q = "s=0&t=0";
   std::string last_addr_str;
   uint16_t last_eibaddr = 0;
   for (int i = 0; i < kAddresses; ++i) {
@@ -130,7 +139,7 @@ TEST_F(ReadHandlerTest, SixHundredAddressesAreAllServed) {
 TEST_F(ReadHandlerTest, InitialReadFromGroupCache) {
   cache_.push(0x0A03, {0x42});  // 1/2/3
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("\"42\""), std::string::npos);
@@ -142,7 +151,7 @@ TEST_F(ReadHandlerTest, InitialReadCacheMissReturnsEmpty) {
   // GroupValueRead is sent asynchronously for the uncached address — the
   // response will arrive later via the cache reader process.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
   EXPECT_NE(r.body.find("\"i\":0"), std::string::npos);
@@ -152,7 +161,7 @@ TEST_F(ReadHandlerTest, InitialReadMultipleAddresses) {
   cache_.push(0x0A03, {0x42});        // 1/2/3
   cache_.push(0x0B04, {0x0C, 0x6F});  // 1/3/4
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
@@ -163,7 +172,7 @@ TEST_F(ReadHandlerTest, InitialReadMultipleAddresses) {
 TEST_F(ReadHandlerTest, InitialReadMixedCachedAndUncached) {
   cache_.push(0x0A03, {0x42});  // only 1/2/3 cached
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
@@ -179,7 +188,7 @@ TEST_F(ReadHandlerTest, TZeroForcesInitialRead) {
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0B04, {0x0C, 0x6F});
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("1/3/4"), std::string::npos);
@@ -193,7 +202,7 @@ TEST_F(ReadHandlerTest, TZeroForcesInitialRead) {
 TEST_F(ReadHandlerTest, LongPollReceivesGroupTelegram) {
   cache_.push(0x0A03, {0x42});
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3");
+  auto r = handler.handle("s=0&a=1/2/3");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
@@ -203,7 +212,7 @@ TEST_F(ReadHandlerTest, LongPollReceivesGroupTelegram) {
 TEST_F(ReadHandlerTest, LongPollSkipsNonMatchingTelegram) {
   cache_.push(0x0B04, {0x0c, 0x6f});  // 1/3/4
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_EQ(r.body.find("1/3/4"), std::string::npos);
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
@@ -213,7 +222,7 @@ TEST_F(ReadHandlerTest, LongPollMultipleTelegrams) {
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0B04, {0x0c, 0x6f});
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
@@ -223,7 +232,7 @@ TEST_F(ReadHandlerTest, LongPollMultipleTelegrams) {
 
 TEST_F(ReadHandlerTest, LongPollTimeoutReturnsEmpty) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
   EXPECT_NE(r.body.find("\"i\":0"), std::string::npos);
@@ -236,7 +245,7 @@ TEST_F(ReadHandlerTest, LongPollTimeoutReturnsEmpty) {
 TEST_F(ReadHandlerTest, WriteWakesBlockedRead) {
   ReadHandler handler(cache_, knxd_, sessions_);
   cache_.push(0x0A03, {0x42});
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
@@ -247,7 +256,7 @@ TEST_F(ReadHandlerTest, WriteWakesBlockedRead) {
 TEST_F(ReadHandlerTest, WriteWakesBlockedReadNonMatchingIgnored) {
   ReadHandler handler(cache_, knxd_, sessions_);
   cache_.push(0x0B04, {0x0c, 0x6f});
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_EQ(r.body.find("1/3/4"), std::string::npos);
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
   // no data delivered → i stays at request_i
@@ -258,7 +267,7 @@ TEST_F(ReadHandlerTest, WriteWakesReadIndexAdvances) {
   ReadHandler handler(cache_, knxd_, sessions_);
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0A03, {0x99});
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_NE(r.body.find("99"), std::string::npos);
   // same address deduplicated → 1 delivery → i = cache position after 2 pushes
   EXPECT_NE(r.body.find("\"i\":2"), std::string::npos);
@@ -272,7 +281,7 @@ TEST_F(ReadHandlerTest, IndexAdvancesPerUniqueAddress) {
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0B04, {0x0c, 0x6f});
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
   // 2 unique addresses → i = 0 + 2 = 2
   EXPECT_NE(r.body.find("\"i\":2"), std::string::npos);
 }
@@ -280,12 +289,12 @@ TEST_F(ReadHandlerTest, IndexAdvancesPerUniqueAddress) {
 TEST_F(ReadHandlerTest, IndexNeverGoesBackward) {
   cache_.push(0x0A03, {0x42});
   ReadHandler h1(cache_, knxd_, sessions_);
-  auto r1 = h1.handle("a=1/2/3&i=0&t=0");
+  auto r1 = h1.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_NE(r1.body.find("\"i\":1"), std::string::npos);
 
   cache_.push(0x0A03, {0x99});
   ReadHandler h2(cache_, knxd_, sessions_);
-  auto r2 = h2.handle("a=1/2/3&i=0&t=0");
+  auto r2 = h2.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_NE(r2.body.find("\"i\":2"), std::string::npos);
 }
 
@@ -297,7 +306,7 @@ TEST_F(ReadHandlerTest, DeduplicatesSameAddress) {
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0A03, {0x99});
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3");
+  auto r = handler.handle("s=0&a=1/2/3");
   size_t first = r.body.find("1/2/3");
   EXPECT_NE(first, std::string::npos);
   size_t second = r.body.find("1/2/3", first + 1);
@@ -312,10 +321,10 @@ TEST_F(ReadHandlerTest, GroupCachePersistsAcrossRequests) {
   cache_.push(0x0A03, {0x42});
   {
     ReadHandler h(cache_, knxd_, sessions_);
-    (void)h.handle("a=1/2/3&t=1");
+    (void)h.handle("s=0&a=1/2/3&t=1");
   }
   ReadHandler h2(cache_, knxd_, sessions_);
-  auto r = h2.handle("a=1/2/3&i=0&t=1");
+  auto r = h2.handle("s=0&a=1/2/3&i=0&t=1");
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
 }
@@ -327,7 +336,7 @@ TEST_F(ReadHandlerTest, GroupCachePersistsAcrossRequests) {
 TEST_F(ReadHandlerTest, FiltersOutReadApdu) {
   // (Read APDU filtered out — not pushed to cache);  // A_GroupValue_Read
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
 }
 
@@ -343,7 +352,7 @@ TEST_F(ReadHandlerTest, BusyBusSkipsNonMatchingThenFindsMatch) {
                                 // Second poll: matching telegram arrives
   cache_.push(0x0A03, {0x42});  // 1/2/3
 
-  auto r = handler.handle("a=1/2/3&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&t=0");
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
   EXPECT_NE(r.body.find("42"), std::string::npos);
   EXPECT_EQ(r.body.find("1/3/4"), std::string::npos);
@@ -355,7 +364,7 @@ TEST_F(ReadHandlerTest, DrainsAllBufferedWhenNoMatch) {
   cache_.push(0x0B04, {0x01});  // 1/3/4 — not subscribed
   cache_.push(0x0C05, {0x02});  // 1/4/5 — not subscribed
 
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
   // Both non-matching telegrams consumed, no data delivered
   EXPECT_EQ(cache_.position(), 2);  // both pushed to cache
@@ -365,7 +374,7 @@ TEST_F(ReadHandlerTest, DrainsAllBufferedWhenNoMatch) {
 TEST_F(ReadHandlerTest, TimeoutAfterEmptyPollsReturnsEmpty) {
   ReadHandler handler(cache_, knxd_, sessions_);
   // No telegrams — timeout after t=1
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
   EXPECT_NE(r.body.find("\"i\":0"), std::string::npos);
 }
@@ -382,7 +391,7 @@ TEST_F(ReadHandlerTest, IndexComesFromCachePosition) {
   }
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0");
   EXPECT_NE(r.body.find("\"i\":42"), std::string::npos);
 }
 
@@ -390,7 +399,7 @@ TEST_F(ReadHandlerTest, IndexComesFromCachePosition) {
 TEST_F(ReadHandlerTest, IndexNeverGoesBackwardAcrossRequests) {
   cache_.push(0x0A03, {0x42});
   ReadHandler h1(cache_, knxd_, sessions_);
-  auto r1 = h1.handle("a=1/2/3&i=0&t=0");
+  auto r1 = h1.handle("s=0&a=1/2/3&i=0&t=0");
   uint32_t i1 = [&]() {
     auto p = r1.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r1.body.substr(p + 4)));
@@ -398,7 +407,7 @@ TEST_F(ReadHandlerTest, IndexNeverGoesBackwardAcrossRequests) {
 
   cache_.push(0x0A03, {0x99});
   ReadHandler h2(cache_, knxd_, sessions_);
-  auto r2 = h2.handle("a=1/2/3&i=" + std::to_string(i1) + "&t=0");
+  auto r2 = h2.handle("s=0&a=1/2/3&i=" + std::to_string(i1) + "&t=0");
   uint32_t i2 = [&]() {
     auto p = r2.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r2.body.substr(p + 4)));
@@ -418,8 +427,8 @@ TEST_F(ReadHandlerTest, TwoReadersReceiveSameUpdate) {
   cache_.push(0x0A03, {0x42});
   cache_.push(0x0A03, {0x42});  // duplicate for second poll
 
-  auto ra = reader_a.handle("a=1/2/3&t=0");
-  auto rb = reader_b.handle("a=1/2/3&t=0");
+  auto ra = reader_a.handle("s=0&a=1/2/3&t=0");
+  auto rb = reader_b.handle("s=0&a=1/2/3&t=0");
 
   EXPECT_NE(ra.body.find("42"), std::string::npos);
   EXPECT_NE(rb.body.find("42"), std::string::npos);
@@ -432,8 +441,8 @@ TEST_F(ReadHandlerTest, WriteUpdatesVisibleToMultipleReaders) {
 
   ReadHandler r1(cache_, knxd_, sessions_);
   ReadHandler r2(cache_, knxd_, sessions_);
-  auto resp1 = r1.handle("a=1/2/3&i=0&t=1");
-  auto resp2 = r2.handle("a=1/2/3&i=0&t=1");
+  auto resp1 = r1.handle("s=0&a=1/2/3&i=0&t=1");
+  auto resp2 = r2.handle("s=0&a=1/2/3&i=0&t=1");
 
   EXPECT_NE(resp1.body.find("42"), std::string::npos);
   EXPECT_NE(resp2.body.find("42"), std::string::npos);
@@ -450,7 +459,7 @@ TEST_F(ReadHandlerTest, DeltaOnlyReturnsNewerThanLastIndex) {
 
   ReadHandler handler(cache_, knxd_, sessions_);
   // Client last saw position 1 — gets new entries from positions 2 and 3
-  auto r = handler.handle("a=1/2/3&i=2&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=2&t=0");
   EXPECT_NE(r.body.find("\"03\""), std::string::npos);
   EXPECT_NE(r.body.find("\"i\":3"), std::string::npos);
 }
@@ -474,7 +483,7 @@ TEST_F(ReadHandlerTest, UnchangedAddressNotRetransmittedWhenOtherChanges) {
 
   // Client polls with i=1 — should ONLY get B (changed at pos 2 and 3).
   // Use t=5 so the thread has time to push.
-  auto r = handler.handle("a=1/2/3&a=1/3/4&i=1&t=5");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&i=1&t=5");
   pusher.join();
 
   EXPECT_EQ(r.body.find("1/2/3"), std::string::npos) << "A must not be retransmitted";
@@ -487,7 +496,7 @@ TEST_F(ReadHandlerTest, OscillatingValueNoStaleRetransmission) {
   cache_.push(0x0A03, {0x00});  // pos 1
 
   ReadHandler h1(cache_, knxd_, sessions_);
-  auto r1 = h1.handle("a=1/2/3&i=0&t=0");
+  auto r1 = h1.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_NE(r1.body.find("00"), std::string::npos);
   uint32_t i1 = [&]() {
     auto p = r1.body.find("\"i\":");
@@ -497,7 +506,7 @@ TEST_F(ReadHandlerTest, OscillatingValueNoStaleRetransmission) {
   // Value changes to 01
   cache_.push(0x0A03, {0x01});
   ReadHandler h2(cache_, knxd_, sessions_);
-  auto r2 = h2.handle("a=1/2/3&i=" + std::to_string(i1) + "&t=0");
+  auto r2 = h2.handle("s=0&a=1/2/3&i=" + std::to_string(i1) + "&t=0");
   EXPECT_NE(r2.body.find("01"), std::string::npos);
   uint32_t i2 = [&]() {
     auto p = r2.body.find("\"i\":");
@@ -507,7 +516,7 @@ TEST_F(ReadHandlerTest, OscillatingValueNoStaleRetransmission) {
   // Value changes back to 00
   cache_.push(0x0A03, {0x00});
   ReadHandler h3(cache_, knxd_, sessions_);
-  auto r3 = h3.handle("a=1/2/3&i=" + std::to_string(i2) + "&t=0");
+  auto r3 = h3.handle("s=0&a=1/2/3&i=" + std::to_string(i2) + "&t=0");
   EXPECT_NE(r3.body.find("00"), std::string::npos);
   uint32_t i3 = [&]() {
     auto p = r3.body.find("\"i\":");
@@ -534,7 +543,7 @@ TEST_F(ReadHandlerTest, MatchingTelegramDeliveredOnBusyBus) {
   cache_.push(0x0A03, {0x42});  // 1/2/3 — MATCH
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=42&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=42&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   // Matching address must be delivered
@@ -556,7 +565,7 @@ TEST_F(ReadHandlerTest, MultipleMatchingOnBusyBus) {
   cache_.push(0x0D06, {0x0c, 0x6f});  // match B (1/5/6)
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/5/6&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/5/6&i=0&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
@@ -589,7 +598,7 @@ public:
     (void)knxd_.open_group_socket(false);
   }
 
-  MockKnxdClient knxd_;  // NOLINT
+  MockBusLink knxd_;  // NOLINT
   SharedGroupCache cache_a_;
   SharedGroupCache cache_b_;
   SessionStore sessions_;
@@ -605,7 +614,7 @@ TEST_F(ReadHandlerMultiCacheTest, NonMonotonicIndexAcrossSeparateCaches) {
   }
 
   ReadHandler handler_a(cache_a_, knxd_, sessions_);
-  auto r_a = handler_a.handle("a=1/2/3&i=0&t=0");
+  auto r_a = handler_a.handle("s=0&a=1/2/3&i=0&t=0");
   uint32_t i_a = [&]() {
     auto p = r_a.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r_a.body.substr(p + 4)));
@@ -619,7 +628,7 @@ TEST_F(ReadHandlerMultiCacheTest, NonMonotonicIndexAcrossSeparateCaches) {
 
   // Read via cache_a — sees the new shared position (15)
   ReadHandler handler_a2(cache_a_, knxd_, sessions_);
-  auto r_a2 = handler_a2.handle("a=1/2/3&i=0&t=0");
+  auto r_a2 = handler_a2.handle("s=0&a=1/2/3&i=0&t=0");
   uint32_t i_a2 = [&]() {
     auto p = r_a2.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r_a2.body.substr(p + 4)));
@@ -638,7 +647,7 @@ TEST_F(ReadHandlerTest, TZeroFindsEnqueuedTelegramsAfterDrain) {
 
   ReadHandler handler(cache_, knxd_, sessions_);
   // t=0 → lastpos=0, timeout_sec=1
-  auto r = handler.handle("a=1/2/3&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   // BUG: without draining before the initial read, this telegram sits in
@@ -659,7 +668,7 @@ TEST_F(ReadHandlerMultiCacheTest, WriteByWorkerANotVisibleInWorkerB) {
   // Worker B handles a subsequent read — uses cache_b (empty)
   ReadHandler handler_b(cache_b_, knxd_, sessions_);
   // t=0 force-reread: should find the value
-  auto r = handler_b.handle("a=1/2/3&t=0");
+  auto r = handler_b.handle("s=0&a=1/2/3&t=0");
 
   // BUG: cache_b doesn't have the value that cache_a received.
   // In production, knxd echoes to all group sockets, so all workers
@@ -692,7 +701,7 @@ TEST_F(ReadHandlerTest, TZeroReturnsPreCachedData) {
   cache_.push(0x0B04, {0x0C, 0x6F});  // 1/3/4
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos)
@@ -715,7 +724,7 @@ TEST_F(ReadHandlerTest, AgeFilterDoesNotRejectFreshData) {
   // because data was pushed just now (timestamp diff < 1 second).
   for (int t_val : {0, 1, 5}) {
     ReadHandler handler(cache_, knxd_, sessions_);
-    auto r = handler.handle("a=1/2/3&t=" + std::to_string(t_val));
+    auto r = handler.handle("s=0&a=1/2/3&t=" + std::to_string(t_val));
     EXPECT_EQ(r.http_status, 200) << "t=" << t_val;
     EXPECT_NE(r.body.find("42"), std::string::npos)
         << "t=" << t_val << " must return freshly-pushed cached value";
@@ -731,7 +740,7 @@ TEST_F(ReadHandlerTest, InitialReadNoIndexReturnsAllCachedData) {
 
   // No t= parameter → max_age_sec=-1 (no age filter).
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
@@ -751,7 +760,7 @@ TEST_F(ReadHandlerTest, DeltaReturnsAllEntriesWhenPositionIsZero) {
 
   // Client requests with i=0 → should get ALL entries (pushed_at > 0).
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&a=1/4/5&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&a=1/4/5&i=0&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
@@ -772,7 +781,7 @@ TEST_F(ReadHandlerTest, DeltaWithZeroIndexNotAffectedBySmallTimeout) {
   // i=0, t=0 (timeout_sec becomes 1 internally).
   // The delta query must return the entry at pos 1 despite the small timeout.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("42"), std::string::npos)
@@ -797,7 +806,7 @@ TEST_F(ReadHandlerTest, DeltaReturnsAllNewerEntriesWhenDataArrives) {
 
   // Client is at i=1, new data at pos 4 arrives during poll.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=1&t=2");
+  auto r = handler.handle("s=0&a=1/2/3&i=3&t=2");
   pusher.join();
 
   EXPECT_EQ(r.http_status, 200);
@@ -806,6 +815,30 @@ TEST_F(ReadHandlerTest, DeltaReturnsAllNewerEntriesWhenDataArrives) {
   EXPECT_NE(r.body.find("\"i\":4"), std::string::npos) << "Position must advance to 4";
   // Entry at pos 1 (i=1, pushed_at=1 is NOT > 1) must not be delivered.
   EXPECT_EQ(r.body.find("01"), std::string::npos) << "Value at pos 1 must not be re-delivered";
+}
+
+/// A client that missed telegrams between two requests gets them immediately:
+/// the handler must not wait for the *next* telegram (which may be hours away)
+/// before delivering what the cache already holds.
+TEST_F(ReadHandlerTest, AvailableDeltaIsDeliveredWithoutWaitingForTheNextTelegram) {
+  cache_.push(0x0A03, {0x01});  // pos 1
+  cache_.push(0x0A03, {0x02});  // pos 2
+  cache_.push(0x0A03, {0x03});  // pos 3
+
+  ReadHandler handler(cache_, knxd_, sessions_);
+  const auto started = std::chrono::steady_clock::now();
+  auto r = handler.handle("s=0&a=1/2/3&i=1&t=5");
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_NE(r.body.find("03"), std::string::npos)
+      << "the newest cached value must be delivered immediately: " << r.body;
+  EXPECT_NE(r.body.find("\"i\":3"), std::string::npos) << r.body;
+  EXPECT_EQ(r.body.find("01"), std::string::npos) << "pos 1 must not be re-delivered";
+  EXPECT_LT(elapsed, 2500)
+      << "the handler waited for the next telegram instead of draining the cache";
 }
 
 /// REGRESSION: t=0 with i=0 (fresh connect) must do initial read and return
@@ -818,7 +851,7 @@ TEST_F(ReadHandlerTest, FreshConnectReturnsAllCachedData) {
 
   // i=0, t=0 — forces initial read, returns latest value.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("04"), std::string::npos)
@@ -832,7 +865,7 @@ TEST_F(ReadHandlerTest, MixedCachedAndUncachedInitialReadWithTZero) {
   cache_.push(0x0A03, {0x42});  // 1/2/3 cached
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos) << "Cached address must be in response";
@@ -858,7 +891,7 @@ TEST_F(ReadHandlerTest, TNegativeReturnsCachedDataImmediately) {
   cache_.push(0x0B04, {0x01});  // 1/3/4
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=-1");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=-1");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos) << "t=-1 must return cached data";
@@ -871,7 +904,7 @@ TEST_F(ReadHandlerTest, TNegativeReturnsCachedDataImmediately) {
 /// t=-1 with no cached data: returns empty d, i=0, no poll.
 TEST_F(ReadHandlerTest, TNegativeEmptyCache) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=-1");
+  auto r = handler.handle("s=0&a=1/2/3&t=-1");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("\"d\":{}"), std::string::npos);
@@ -885,7 +918,7 @@ TEST_F(ReadHandlerTest, TNegativeIgnoresIndexForcesInitialRead) {
 
   // Even with i=999 (beyond current position), t=-1 forces initial read.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=999&t=-1");
+  auto r = handler.handle("s=0&a=1/2/3&i=999&t=-1");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("42"), std::string::npos) << "t=-1 must return cached data regardless of i";
@@ -897,7 +930,7 @@ TEST_F(ReadHandlerTest, TLargeNegativeReturnsCachedDataImmediately) {
   cache_.push(0x0A03, {0x42});
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=-999");
+  auto r = handler.handle("s=0&a=1/2/3&t=-999");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("42"), std::string::npos) << "t=-999 must return cached data immediately";
@@ -916,7 +949,7 @@ TEST_F(ReadHandlerTest, TLargeNegativeReturnsCachedDataImmediately) {
 /// t=0 sends GroupValueRead for a single uncached address.
 TEST_F(ReadHandlerTest, TZeroSendsGroupValueReadForUncached) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&t=0");
 
   // Response must be immediate (non-blocking) even with cache miss.
   EXPECT_EQ(r.http_status, 200);
@@ -935,7 +968,7 @@ TEST_F(ReadHandlerTest, TZeroSendsGroupValueReadForUncached) {
 /// t=0 sends GroupValueRead for multiple uncached addresses.
 TEST_F(ReadHandlerTest, TZeroSendsGroupValueReadForMultipleUncached) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&a=1/4/5&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&a=1/4/5&t=0");
 
   EXPECT_EQ(r.http_status, 200);
 
@@ -959,7 +992,7 @@ TEST_F(ReadHandlerTest, TZeroOnlyReadsUncachedAddresses) {
   cache_.push(0x0A03, {0x42});  // 1/2/3 already cached
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
 
   EXPECT_EQ(r.http_status, 200);
 
@@ -975,13 +1008,25 @@ TEST_F(ReadHandlerTest, TZeroOnlyReadsUncachedAddresses) {
   EXPECT_EQ(sent[0].apdu[1], 0x00);
 }
 
+/// A full TX ring (or a missing bus) must stop the t=0 read storm at the first
+/// rejected telegram instead of hammering a queue that cannot accept them.
+TEST_F(ReadHandlerTest, TZeroStopsGeneratingReadsWhenTheBusRejectsThem) {
+  knxd_.set_send_fail_count(1);
+
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&a=1/4/5&t=0");
+
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_TRUE(knxd_.sent_packets().empty()) << "nothing may be queued after the first rejection";
+}
+
 /// t=0 with all addresses cached: no GroupValueRead needed.
 TEST_F(ReadHandlerTest, TZeroNoGroupValueReadWhenAllCached) {
   cache_.push(0x0A03, {0x42});        // 1/2/3
   cache_.push(0x0B04, {0x0C, 0x6F});  // 1/3/4
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&a=1/3/4&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&a=1/3/4&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("1/2/3"), std::string::npos);
@@ -996,7 +1041,7 @@ TEST_F(ReadHandlerTest, TZeroNoGroupValueReadWhenAllCached) {
 /// Only t=0 triggers bus reads — other t values use cache + poll only.
 TEST_F(ReadHandlerTest, TPositiveDoesNotSendGroupValueRead) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=1");
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
 
   EXPECT_EQ(r.http_status, 200);
 
@@ -1008,7 +1053,7 @@ TEST_F(ReadHandlerTest, TPositiveDoesNotSendGroupValueRead) {
 /// t<0 (cache only) does NOT send GroupValueRead.
 TEST_F(ReadHandlerTest, TNegativeDoesNotSendGroupValueRead) {
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=-1");
+  auto r = handler.handle("s=0&a=1/2/3&t=-1");
 
   EXPECT_EQ(r.http_status, 200);
 
@@ -1020,7 +1065,7 @@ TEST_F(ReadHandlerTest, TNegativeDoesNotSendGroupValueRead) {
 /// Long-poll (no t parameter) does NOT send GroupValueRead.
 TEST_F(ReadHandlerTest, NoTParameterDoesNotSendGroupValueRead) {
   ReadHandler handler(cache_, knxd_, sessions_, 1);
-  auto r = handler.handle("a=1/2/3");
+  auto r = handler.handle("s=0&a=1/2/3");
 
   EXPECT_EQ(r.http_status, 200);
 
@@ -1042,7 +1087,7 @@ TEST_F(ReadHandlerTest, IndexWrapsAtModulus) {
   }
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=0&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("\"i\":" + std::to_string(kPositionModulus - 1)), std::string::npos)
       << "i should be M-1 = 99,999 before wrap";
@@ -1051,7 +1096,7 @@ TEST_F(ReadHandlerTest, IndexWrapsAtModulus) {
   cache_.push(0x0A03, {0x42});
 
   ReadHandler handler2(cache_, knxd_, sessions_);
-  auto r2 = handler2.handle("a=1/2/3&i=0&t=0");
+  auto r2 = handler2.handle("s=0&a=1/2/3&i=0&t=0");
   EXPECT_EQ(r2.http_status, 200);
   EXPECT_NE(r2.body.find("\"i\":0"), std::string::npos) << "i must wrap to 0 after M pushes";
 }
@@ -1068,7 +1113,7 @@ TEST_F(ReadHandlerTest, EpochMismatchReturnsCurrentValues) {
 
   // Client sends i=10 (early epoch): epoch_distance = M-12 >= M/2 → epoch mismatch.
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&i=10&t=0");
+  auto r = handler.handle("s=0&a=1/2/3&i=10&t=0");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_NE(r.body.find("\"42\""), std::string::npos)
@@ -1085,7 +1130,7 @@ TEST_F(ReadHandlerTest, IndexMonotonicAcrossWrap) {
   }
 
   ReadHandler h1(cache_, knxd_, sessions_);
-  auto r1 = h1.handle("a=1/2/3&i=0&t=0");
+  auto r1 = h1.handle("s=0&a=1/2/3&i=0&t=0");
   uint32_t i1 = [&]() {
     auto p = r1.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r1.body.substr(p + 4)));
@@ -1097,7 +1142,7 @@ TEST_F(ReadHandlerTest, IndexMonotonicAcrossWrap) {
   cache_.push(0x0A03, {0x99});  // advance to 1
 
   ReadHandler h2(cache_, knxd_, sessions_);
-  auto r2 = h2.handle("a=1/2/3&i=" + std::to_string(i1) + "&t=0");
+  auto r2 = h2.handle("s=0&a=1/2/3&i=" + std::to_string(i1) + "&t=0");
   uint32_t i2 = [&]() {
     auto p = r2.body.find("\"i\":");
     return static_cast<uint32_t>(std::stoul(r2.body.substr(p + 4)));
@@ -1115,11 +1160,11 @@ TEST_F(ReadHandlerTest, IndexMonotonicAcrossWrap) {
 
 TEST_F(ReadHandlerTest, ReportsTheKnxdOutageAs503AndStillServesCachedData) {
   cache_.push(0x0A03, {0x42});
-  cache_.publish_knxd_status(true, 1000);
-  cache_.publish_knxd_status(false, 1500);
+  cache_.publish_bus_status(true, 1000);
+  cache_.publish_bus_status(false, 1500);
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=-1");  // cache only, no poll
+  auto r = handler.handle("s=0&a=1/2/3&t=-1");  // cache only, no poll
 
   EXPECT_EQ(r.http_status, 503) << "a read must not report success while knxd is gone";
   EXPECT_NE(r.body.find("\"42\""), std::string::npos) << "last known value must still be sent";
@@ -1130,11 +1175,11 @@ TEST_F(ReadHandlerTest, ReportsTheKnxdOutageAs503AndStillServesCachedData) {
 }
 
 TEST_F(ReadHandlerTest, OutageIsReportedWithoutWaitingForTheLongPollTimeout) {
-  cache_.publish_knxd_status(false, 1500);
+  cache_.publish_bus_status(false, 1500);
 
   ReadHandler handler(cache_, knxd_, sessions_);
   const auto start = std::chrono::steady_clock::now();
-  auto r = handler.handle("a=1/2/3&t=5");  // would otherwise poll for 5 s
+  auto r = handler.handle("s=0&a=1/2/3&t=5");  // would otherwise poll for 5 s
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - start)
                               .count();
@@ -1145,16 +1190,16 @@ TEST_F(ReadHandlerTest, OutageIsReportedWithoutWaitingForTheLongPollTimeout) {
 }
 
 TEST_F(ReadHandlerTest, ReportsAnOutageThatStartsDuringThePoll) {
-  cache_.publish_knxd_status(true, 1000);
+  cache_.publish_bus_status(true, 1000);
 
   // knxd dies while the request is waiting on the condition variable.
   std::thread killer([this] {
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    cache_.publish_knxd_status(false, 1010);
+    cache_.publish_bus_status(false, 1010);
   });
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=1");  // 1 s poll
+  auto r = handler.handle("s=0&a=1/2/3&t=1");  // 1 s poll
 
   killer.join();
 
@@ -1164,11 +1209,128 @@ TEST_F(ReadHandlerTest, ReportsAnOutageThatStartsDuringThePoll) {
 
 TEST_F(ReadHandlerTest, HasNoKnxdBlockWhileKnxdIsAvailable) {
   cache_.push(0x0A03, {0x42});
-  cache_.publish_knxd_status(true, 1000);
+  cache_.publish_bus_status(true, 1000);
 
   ReadHandler handler(cache_, knxd_, sessions_);
-  auto r = handler.handle("a=1/2/3&t=-1");
+  auto r = handler.handle("s=0&a=1/2/3&t=-1");
 
   EXPECT_EQ(r.http_status, 200);
   EXPECT_EQ(r.body.find("\"knxd\""), std::string::npos) << r.body;
+}
+
+// ================================================================
+// Timeout / index parameter edge cases
+// ================================================================
+
+TEST_F(ReadHandlerTest, EmptyTimeoutParameterIsRejected) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&t=");
+  EXPECT_EQ(r.http_status, 400);
+  EXPECT_NE(r.body.find("invalid timeout"), std::string::npos);
+}
+
+TEST_F(ReadHandlerTest, TimeoutWithTrailingGarbageIsRejected) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&t=5x");
+  EXPECT_EQ(r.http_status, 400);
+}
+
+TEST_F(ReadHandlerTest, NegativeIndexIsIgnored) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&i=-5&t=-1");
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_NE(r.body.find(R"("i":0)"), std::string::npos) << r.body;
+}
+
+TEST_F(ReadHandlerTest, UnrelatedTelegramsKeepTheLoopPollingUntilTheDeadline) {
+  // Two pushes of a non-subscribed address wake the loop without producing a
+  // delta; the second wake-up happens after the deadline, which ends the poll
+  // loop instead of waiting again.
+  ReadHandler handler(cache_, knxd_, sessions_);
+  std::thread writer([this] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    cache_.push(0x0909, {0x01});
+    // Land after the deadline of the second wait (1.0 s) but before it ends
+    // (1.5 s), so the loop has to notice that the deadline has passed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    cache_.push(0x0909, {0x02});
+  });
+  auto r = handler.handle("s=0&a=1/2/3&t=1");
+  writer.join();
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_NE(r.body.find(R"("d":{})"), std::string::npos) << r.body;
+}
+
+TEST_F(ReadHandlerTest, UnparsableIndexIsIgnored) {
+  ReadHandler handler(cache_, knxd_, sessions_);
+  auto r = handler.handle("s=0&a=1/2/3&i=abc&t=-1");
+  EXPECT_EQ(r.http_status, 200);
+  EXPECT_NE(r.body.find(R"("i":0)"), std::string::npos) << r.body;
+}
+
+// ================================================================
+// Client wait limit
+// ================================================================
+
+TEST(ClientWaitLimit, ClampsToTheHardLimit) {
+  // A short wait is honoured ...
+  EXPECT_EQ(clamp_client_wait(10), 10);
+  EXPECT_EQ(clamp_client_wait(kMaxClientWaitSec), kMaxClientWaitSec);
+  // ... a longer one is cut at the hard limit (the client re-creates the
+  // request after 300 s, so 330 s never races with it) ...
+  EXPECT_EQ(clamp_client_wait(kMaxClientWaitSec + 1), kMaxClientWaitSec);
+  EXPECT_EQ(clamp_client_wait(999999), kMaxClientWaitSec);
+  // ... and "no wait" stays "no wait" (t=0 = read now, t<0 = cache only).
+  EXPECT_EQ(clamp_client_wait(0), 0);
+  EXPECT_EQ(clamp_client_wait(-42), -42);
+}
+
+TEST(ClientWaitLimit, TheHardLimitIsJustAboveTheClientTimeout) {
+  EXPECT_GE(kMaxClientWaitSec, 300);
+  EXPECT_LE(kMaxClientWaitSec, 360);
+}
+
+// ================================================================
+// The initial read is one atomic snapshot (values + position)
+// ================================================================
+
+/// A telegram that arrives while the initial read runs must be part of that
+/// answer or be newer than the reported `i`.  It must never fall between the
+/// two: the client would then advertise an index that already covers the
+/// telegram, and no later delta would ever match it.
+TEST_F(ReadHandlerTest, ATelegramPushedDuringTheInitialReadIsNeverLost) {
+  constexpr int kAddresses = 24;
+  std::string query = "s=0";
+  for (int i = 1; i <= kAddresses; ++i) {
+    query += "&a=1/0/" + std::to_string(i);
+  }
+
+  std::thread pusher([this] {
+    for (int i = 1; i <= kAddresses; ++i) {
+      cache_.push(static_cast<uint16_t>(0x0800 | i), {static_cast<uint8_t>(i)});
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  });
+
+  ReadHandler initial(cache_, knxd_, sessions_);
+  const auto first = initial.handle(query + "&t=-1");  // initial read, no poll
+  pusher.join();
+  ASSERT_EQ(first.http_status, 200);
+
+  const auto at = first.body.rfind("\"i\":");
+  ASSERT_NE(at, std::string::npos) << first.body;
+  const auto position = std::stoul(first.body.substr(at + 4));
+
+  // The follow-up poll starts from exactly the reported index.
+  ReadHandler follower(cache_, knxd_, sessions_, /*longpoll_timeout_sec=*/1);
+  const auto second = follower.handle(query + "&i=" + std::to_string(position));
+  ASSERT_EQ(second.http_status, 200);
+
+  for (int i = 1; i <= kAddresses; ++i) {
+    const std::string key = "\"1/0/" + std::to_string(i) + "\":";
+    const bool in_first = first.body.find(key) != std::string::npos;
+    const bool in_second = second.body.find(key) != std::string::npos;
+    EXPECT_TRUE(in_first || in_second)
+        << "address 1/0/" << i << " was lost\nfirst: " << first.body << "\nsecond: " << second.body;
+  }
 }

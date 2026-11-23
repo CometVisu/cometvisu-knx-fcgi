@@ -16,15 +16,27 @@
 /**
  * @file query_string.cpp
  * @brief Implementation of the query string parser.
+ *
+ * The parser is deliberately lenient about *content* and strict about *size*:
+ * a malformed pair is skipped instead of rejecting the whole request (the
+ * CometVisu client appends parameters of different generations, and a single
+ * stray byte must not break a working installation), while the pair/key/value
+ * limits keep the work per request bounded — the query string arrives straight
+ * from an untrusted HTTP client.
  */
 
 #include "query_string.h"
 
-namespace cvknxd {
+namespace cvknx {
 
 namespace {
 
-// Simple URL percent-decoder
+/// Decode `%XX` escapes and `+` in a key or value.
+///
+/// A `%` that is not followed by two hex digits is *kept verbatim* rather than
+/// dropped: the caller (the handlers) logs and echoes addresses back to the
+/// client, so silently deleting bytes would hide what was actually sent.  The
+/// same reason keeps the function total — it never fails.
 std::string url_decode(std::string_view str) {
   std::string result;
   result.reserve(str.size());
@@ -50,6 +62,8 @@ std::string url_decode(std::string_view str) {
         continue;
       }
     }
+    // `+` is the application/x-www-form-urlencoded escape for a space (the
+    // format FastCGI uses for QUERY_STRING); decode it here, not in the caller.
     if (str[i] == '+') {
       result.push_back(' ');
     } else {
@@ -68,15 +82,17 @@ QueryString::QueryString(std::string_view raw) {
 
   size_t pos = 0;
   size_t total_pairs = 0;
+  // Split on the raw `&`/`=` delimiters *before* decoding, so an encoded
+  // `%26`/`%3D` inside a value can never fabricate a new pair.
   while (pos < raw.size()) {
-    // Enforce total pair limit
+    // The limits are the only thing between a hostile query string and
+    // unbounded memory use — the request itself is already fully in memory.
     if (total_pairs >= kMaxTotalPairs) {
       limit_exceeded_ = true;
       break;
     }
     ++total_pairs;
 
-    // Find key=value pair
     const size_t eq = raw.find('=', pos);
     const size_t amp = raw.find('&', pos);
 
@@ -115,7 +131,8 @@ QueryString::QueryString(std::string_view raw) {
 
 std::optional<std::string_view> QueryString::get(std::string_view key) const {
   auto it = params_.find(key);
-  if (it != params_.end() && !it->second.empty()) {
+  // A key only exists while it has at least one value, so no empty() check.
+  if (it != params_.end()) {
     return std::string_view{it->second.front()};
   }
   return std::nullopt;
@@ -138,4 +155,4 @@ bool QueryString::has(std::string_view key) const {
   return params_.find(key) != params_.end();
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx

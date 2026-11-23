@@ -20,7 +20,7 @@
 
 #include "fcgi_request.h"
 
-namespace cvknxd {
+namespace cvknx {
 
 std::string_view FcgiRequest::path() const {
   // PATH_INFO is the primary source for the endpoint path.
@@ -71,4 +71,4 @@ std::string_view FcgiRequest::path() const {
   return uri_path;
 }
 
-}  // namespace cvknxd
+}  // namespace cvknx
