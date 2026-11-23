@@ -82,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The project is renamed** from `cometvisu-knxd-fcgi` to
   `cometvisu-knx-fcgi` (<https://github.com/CometVisu/cometvisu-knx-fcgi>).
   Update container, systemd and supervisor commands that start the binary by
-  path; a `cometvisu-knxd-fcgi` symlink keeps existing setups working.
+  path.  Deployments that still use the old path can provide a
+  `cometvisu-knxd-fcgi -> cometvisu-knx-fcgi` symlink.
 - **The outage block in `/r` and `/w` uses a transport-specific key**: `"knxd"`
   for the knxd transport (unchanged) and `"bus"` for the KNXnet/IP transports.
   The inner object (`ok`, `since`, `lastOk`) is identical.

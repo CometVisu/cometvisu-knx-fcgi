@@ -1,8 +1,20 @@
 # cometvisu-knx-fcgi
 
-FastCGI backend in modern C++ that implements the
-[CometVisu Protocol](https://github.com/CometVisu/CometVisu/wiki/Protocol)
-and connects to the KNX bus.
+FastCGI backend in modern C++ that connects a
+[CometVisu](https://github.com/CometVisu/CometVisu) installation to the KNX bus.
+
+The client contract — the CometVisu protocol — is specified in the CometVisu
+wiki, which is its only normative source:
+
+* [Protocol (English)](https://github.com/CometVisu/CometVisu/wiki/Protocol)
+* [Protokoll (Deutsch)](https://github.com/CometVisu/CometVisu/wiki/Protokoll)
+
+This README documents the backend itself: how to build, run and configure it,
+and how it behaves where the protocol leaves room for an implementation
+([Protocol implementation notes](#protocol-implementation-notes)).  The
+architecture and design decisions are in [AGENTS.md](AGENTS.md), deferred work
+in [ROADMAP.md](ROADMAP.md) and the release history in
+[CHANGELOG.md](CHANGELOG.md).
 
 Bus access goes through one of three transports, all equally supported:
 
@@ -29,65 +41,134 @@ changed four things that a deployment has to follow:
 | started by `spawn-fcgi` on stdin/stdout | `FCGI_SOCKET` is required; the backend opens and serves the listen socket itself |
 | `/r` and `/w` worked without `s` | both answer `401` without the protocol's session parameter `s` |
 
-A symlink `cometvisu-knxd-fcgi -> cometvisu-knx-fcgi` keeps old paths working;
-everything else needs an explicit setting.  See
-[CHANGELOG.md](CHANGELOG.md) for the full list, including the transport-specific
-outage key (`"knxd"` vs `"bus"`).
+If an existing deployment still starts the binary under the old name, provide a
+symlink `cometvisu-knxd-fcgi -> cometvisu-knx-fcgi`; everything else needs an
+explicit setting.  See [CHANGELOG.md](CHANGELOG.md) for the full list, including
+the transport-specific outage key (`"knxd"` vs `"bus"`).
 
-## Endpoints
+## Protocol implementation notes
 
-All three endpoints take their parameters in the query string and answer JSON.
-`ADDRESS_PREFIX` decides whether addresses are written `1/2/3` (default) or
-`KNX:1/2/3`.
+The protocol itself — endpoints, parameters, response format and status codes —
+is defined in the CometVisu wiki ([English](https://github.com/CometVisu/CometVisu/wiki/Protocol),
+[German](https://github.com/CometVisu/CometVisu/wiki/Protokoll)).  This section
+records only what is specific to this backend, so a client author or operator
+knows where the implementation narrows or extends the general definition.
 
-| Endpoint | Purpose | Parameters |
+### Endpoints
+
+| Endpoint | Purpose | Notes |
 |---|---|---|
-| `/l` | login, creates a session | `u`, `p` (accepted, not validated — see [Security](#security)) |
-| `/r` | read values, long-poll | `s` session, `a` address (repeatable), `t` timeout/age filter, `i` last known position |
-| `/w` | write a group value | `s` session, `a` address (repeatable), `v` hex APDU |
+| `/l` | login, creates a session | `u`/`p` are accepted but never validated, `d` is ignored; the answer carries an extra `c` object |
+| `/r` | read values, long-poll | requires `s` and at least one `a`; filter ids (`f`) and address hashes (`h`) are not supported |
+| `/w` | write a group value | requires `s`; `a` is repeatable, `v` carries the APDU (see below) |
+| `/f` | filter management | not implemented, answers `404 {"error":"unknown endpoint"}` |
+| anything else | — | `404 {"error":"unknown endpoint"}` |
 
-**`GET /l`** returns the protocol version and a new session id; with `BASE_URL`
-or build information a `"c"` configuration block is added:
+Parameters are read from the query string.  The HTTP method is not inspected,
+so `GET` and `POST` behave identically; a request body is read (up to 64 KiB)
+and ignored.
+
+### Sessions
+
+* `/l` returns `{"v":"0.0.2","s":"<id>"}`.  Without `u` and `p` the id is the
+  anonymous session `"0"`.  A normal build also adds a `"c"` object with
+  `fcgiVersion`, `fcgiGitHash` and — when configured — `baseURL`,
+  `knxdBuildVersion`, `knxdBuildGitHash` and the raw members of
+  `LOGIN_EXTRA_CONFIG`.  Clients must ignore keys they do not know (the
+  protocol allows this).
+* `/r` and `/w` require `s`: a missing parameter answers
+  `401 {"error":"missing session"}`, an unknown or expired id
+  `401 {"error":"invalid session"}`.  The anonymous id `"0"` is always valid.
+* A session lives for `SESSION_TTL_SEC` (default 30 min).  The store keeps
+  `SESSION_MAX` sessions and evicts the oldest one when it is full, so a client
+  that logs in again always receives an id.  A `401` therefore means "log in
+  again", not "wrong password" — the backend never checks credentials.
+* Authentication is the web server's job, see [Security](#security).
+
+### Addresses
+
+* `X/Y/Z` or `NAMESPACE:X/Y/Z`, e.g. `1/2/3` or `KNX:1/2/3`.  Without a
+  namespace the `ADDRESS_PREFIX` setting applies (empty by default).  The
+  response uses the namespace that the request used, so the keys match what the
+  client sent.
+* Only numeric three-level addresses are accepted; wildcards are **not**
+  supported.
+* Addresses that cannot be parsed are skipped.  `/r` and `/w` answer `404` only
+  when *none* of the given addresses could be parsed.
+
+### Read (`/r`)
+
+* Each value is the APDU data as lowercase hex without separators: `"42"` for
+  one byte, `"0c6f"` for two bytes.
+* `i` is a JSON **number** — the position of the shared cache, monotonically
+  increasing across all workers.  The client must send the value back verbatim;
+  a missing `i` or `i=0` requests a full snapshot, a non-numeric or negative
+  `i` is ignored (treated as `0`).
+* `t` absent: long-poll for up to `LONGPOLL_TIMEOUT_SEC` (default 300 s).  If
+  nothing arrives, the backend answers `200` with the current `i` and a
+  possibly empty `d`; the client simply repeats the request.
+* `t=0`: answer with the cached snapshot and send `A_GroupValue_Read` for every
+  address without a value.  The request waits at most about one second for the
+  answers; a value that arrives later is delivered by the next read.
+* `t>0`: values must be at most `t` seconds old; the request then polls for up
+  to `t` seconds for newer values.  `t` is capped at 330 s.
+* `t<0`: cache only — no bus read, no age filter, immediate answer.
+* A `t` that is not a number answers `400 {"error":"invalid timeout"}`.
+* At most `max(1, FCGI_WORKERS - 2)` requests may long-poll at the same time;
+  further reads answer `503 {"error":"too many long-poll requests"}`.  `/w` and
+  `/l` are never limited this way.
+* Query-string limits: 256 keys, 4096 values per key (`a`), 8192 pairs in
+  total.  Exceeding a limit answers `400 {"error":"too many addresses"}` — an
+  address list is never truncated silently.
+
+### Write (`/w`)
+
+* `v` is the group-value APDU **including the TPCI/APCI octets**, hex without
+  separators:
+  * `800c6f` — `A_GroupValue_Write` with the two data bytes `0c 6f`
+  * `8a` — a 6-bit value `0x0a` (`A_GroupValue_Write` with the value in the
+    second octet)
+  * `8042` — the multi-octet form for a one-byte value above `0x3F`
+  * the APDU may be at most 14 bytes.
+* A missing `a` or `v` is a no-op and answers `200` (the reference
+  implementation behaves the same way).
+* A `v` that is not a write APDU answers `400 {"error":"invalid value"}`.
+* All parsable addresses are written; unparsable ones are skipped.  If none
+  parses, the answer is `404 {"error":"invalid address format"}`.
+* Failure answers `503`:
+  `{"error":"write failed","failed":1,"total":1,"knxd":{...}}` (all writes
+  failed) or `"write partially failed"` (some succeeded).  `200` is only
+  answered when every telegram was handed to the bus; an outgoing telegram rate
+  limit (`KNX_TX_MAX_PER_SEC`) applies.
+
+### Bus outage reporting
+
+While the bus connection is unavailable, `/r` and `/w` append an outage block:
 
 ```json
-{"v":"0.0.2","s":"9f1c0d2a4b6e8f70","c":{"baseURL":"/proxy/visu","fcgiVersion":"2.0.0"}}
+{"d":{"1/2/3":"42"},"i":141,"knxd":{"ok":false,"since":1763000000,"lastOk":1762990000}}
 ```
 
-Without `u`/`p` the session is the anonymous id `"0"`, which stays valid for
-every later request.
+* The key is `"knxd"` for `KNX_TRANSPORT=knxd` and `"bus"` for the KNXnet/IP
+  transports; the inner object is identical.  Note that the current CometVisu
+  client only recognises `"knxd"`, so an IP-transport outage is not yet shown
+  by the client — see [ROADMAP.md](ROADMAP.md).
+* `since` is the Unix time the current outage started, `lastOk` the Unix time of
+  the last successful connection (both omitted when unknown).  The field is
+  absent while the bus is reachable.
+* `/r` answers `503` immediately (no long-poll — nothing can arrive) and still
+  carries the last known values; `/w` answers `503`.
 
-**`GET /r`** returns the values of the requested addresses plus the shared cache
-position `i`, which the client sends back as `i=` on the next request:
+### Status codes
 
-```json
-{"d":{"1/2/3":"42","1/2/4":"0c6f"},"i":141}
-```
-
-* `t` absent — long-poll up to `LONGPOLL_TIMEOUT_SEC` seconds, no age filter.
-* `t=0` — read from the bus: return cached values, enqueue a `GroupValueRead`
-  for every address without a cached value, return immediately.
-* `t>0` — return values at most `t` seconds old, then poll for `t` seconds
-  (capped at 330).
-* `t<0` — cache only, return immediately.
-* `i` absent or `0` — a full snapshot instead of a delta.
-
-Status codes: `200` ok, `400` malformed request (missing/invalid address list,
-`t` not a number, too many parameters), `401` missing/invalid session, `404` no
-address could be parsed, `503` the bus is unavailable (the body still carries
-the last known values plus the outage block).
-
-**`GET`/`POST /w`** writes the APDU given in `v` (hex, with the APCI byte, e.g.
-`800c6f` for a 2-byte write of `0x0c6f`) to every address in `a`:
-
-* `200` — empty body, the telegram was handed to the bus.
-* `400` — `v` is not an `A_GroupValue_Write`, or the parameter list was cut off.
-* `404` — no address could be parsed.
-* `503` — `{"error":"write failed","failed":1,"total":1,"knxd":{...}}` — the
-  write did not reach the bus (partial failures report the counts and
-  `"write partially failed"`).
-
-A write is never answered with `200` unless it left the backend, and the
-outgoing rate is capped globally by `KNX_TX_MAX_PER_SEC`.
+| Code | Meaning |
+|---|---|
+| `200` | success — including a long-poll that ended without new data |
+| `400` | malformed request: bad `t`, bad `v`, missing address list, query-string limit exceeded |
+| `401` | missing or unknown session |
+| `404` | no address could be parsed, or unknown endpoint |
+| `500` | internal error (a handler raised an exception; the worker stays alive) |
+| `503` | bus unavailable, write failed, or too many concurrent long-polls |
 
 ## Quick Start
 
@@ -133,7 +214,7 @@ and built automatically after the container is created; the existing
 > group `224.0.23.12` must be reachable from the container — on Linux add
 > `"runArgs": ["--network=host"]` to `.devcontainer/devcontainer.json`.
 
-### Run tests / Run the server
+### Running and testing
 
 ```bash
 # Run tests
@@ -198,9 +279,9 @@ does that for you.
 | `KNX_IP_HEARTBEAT_SEC`| `60`       | `ip-tunnel`: `CONNECTIONSTATE_REQUEST` interval (10–86400) |
 | `KNX_IP_ACK_TIMEOUT_MS`| `1000`    | `ip-tunnel`: ACK timeout before retransmitting (10–60000) |
 | `KNX_IP_RETRIES`      | `3`        | `ip-tunnel`: retransmissions per telegram (1–10) |
-| `FCGI_SOCKET`         | *(required)* | FCGI listen socket: `:port` for TCP, or a filesystem path for a Unix socket. The backend opens it itself; a Unix socket is created with mode `0660`. A TCP port has no authentication or peer check — keep it on loopback. |
+| `FCGI_SOCKET`         | *(required)* | FCGI listen socket: `:port` or `host:port` for TCP, or a filesystem path for a Unix socket. The backend opens it itself; a Unix socket is created with mode `0660`. A TCP socket has no authentication or peer check — `:port` listens on all interfaces, so bind a loopback address (`127.0.0.1:9000`) or keep the port behind a firewall. |
 | `FCGI_WORKERS`        | `20`       | Number of pre-forked worker processes (1–256). Each worker serves one request at a time; an idle worker costs a few MB of RAM. Workers never open a bus connection of their own — they enqueue writes into the shared TX queue. Two workers are kept free for `/w` and `/l`, so at most `max(1, FCGI_WORKERS - 2)` long-polls are served at the same time. |
-| `LONGPOLL_TIMEOUT_SEC`| `300`      | Max seconds to wait in long-poll `/r` |
+| `LONGPOLL_TIMEOUT_SEC`| `300`      | Max seconds to wait in long-poll `/r` (1–330).  A client supplied `t` is capped at the same value. |
 | `KNX_TX_MAX_PER_SEC`  | `10`       | Hard upper bound on outgoing telegrams per second over **all** clients and workers (1–1000). The cache reader is the only process that sends, so this limit cannot be bypassed by a client — or by a buggy one — and it protects the bus from flooding. |
 | `BASE_URL`            | *(unset)*  | When set, the login (`/l`) response includes a config object `"c"` with `"baseURL"` set to this value. Used by the web server to advertise the URL prefix under which the backend is reachable (e.g. `/proxy/visu`). |
 | `SESSION_TTL_SEC`     | `1800`     | Lifetime of a session in seconds (1–604800). Sessions are independent of the request wait limit. |
@@ -210,8 +291,8 @@ does that for you.
 | `LOGIN_EXTRA_CONFIG`  | *(unset)*  | Raw JSON members appended to the `"c"` block of the `/l` response (e.g. `"foo":"bar"`). |
 | `DEBUG_BACKEND`       | *(unset)*  | Set to `1` to enable debug logging to stderr |
 
-At startup, the server logs the effective values of all configuration
-environment variables to stdout:
+At startup, the server logs the effective bus configuration and the most
+important limits to stdout (`--help` lists every environment variable):
 
 ```
 [INFO] cometvisu-knx-fcgi 2.0.0 starting
@@ -219,7 +300,7 @@ environment variables to stdout:
 [INFO]   KNX_TRANSPORT         knxd
 [INFO]   BUS                   transport=knxd socket=/run/knx
 [INFO]   FCGI_SOCKET           /run/cometvisu-fcgi.sock
-[INFO]   FCGI_WORKERS          9
+[INFO]   FCGI_WORKERS          20
 [INFO]   LONGPOLL_TIMEOUT_SEC  300
 [INFO]   KNX_TX_MAX_PER_SEC    10
 [INFO]   ADDRESS_PREFIX        (not set)
@@ -300,10 +381,10 @@ backend must never be reachable without it.  In practice this means:
   on an isolated, trusted VLAN (or use `ip-tunnel` and, eventually, KNX IP
   Secure — see [ROADMAP.md](ROADMAP.md)).
 - `KNX_TX_MAX_PER_SEC` (default 10) caps the outgoing telegram rate over all
-clients; it is a protection against a buggy or hostile client flooding the bus,
-not a substitute for supervision.
+  clients; it is a protection against a buggy or hostile client flooding the
+  bus, not a substitute for supervision.
 - `DEBUG_BACKEND=1` logs request URIs; the `u`/`p` values of `/l` are redacted,
-but keep such logs protected anyway.
+  but keep such logs protected anyway.
 
 ## License
 

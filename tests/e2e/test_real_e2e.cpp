@@ -1016,7 +1016,7 @@ TEST_F(RealKnxdE2ETest, IndexNeverGoesBackwardSequentialReads) {
 
 /// Two concurrent readers sharing a single KnxdClient (via Router) must
 /// never see backward i values.  This simulates the fork-based worker pool
-/// where all workers share one knxd connection (spawn-fcgi mode).
+/// where all workers share the one bus connection.
 TEST_F(RealKnxdE2ETest, IndexNeverGoesBackwardConcurrentReaders) {
   SessionStore sessions_a;
   SessionStore sessions_b;

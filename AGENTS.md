@@ -4,9 +4,16 @@ This file provides guidelines for AI coding agents working on the
 `cometvisu-knx-fcgi` project.
 
 **Roadmap:** [ROADMAP.md](ROADMAP.md) lists the deferred work (the `/f`
-endpoint, KNX IP Secure, hardware interop).  The transport layer (phases P0–P8
-of the former `PLAN-KNXNETIP.md`) shipped in 2.0.0; this file is the design
-record, the git history holds the implementation plan.
+endpoint, KNX IP Secure, hardware interop).  The transport layer shipped in
+2.0.0; this file is the design record, the git history holds the implementation
+plan.
+
+**Docs:** the client contract is the CometVisu wiki
+([Protocol](https://github.com/CometVisu/CometVisu/wiki/Protocol) /
+[Protokoll](https://github.com/CometVisu/CometVisu/wiki/Protokoll)).  Do not
+paste the protocol definition into [README.md](README.md) — it documents the
+backend (build, configuration, backend-specific behaviour) and links to the
+wiki instead.
 
 **Development container:** `.devcontainer/` provides the full toolchain
 (g++, clang, cmake, ninja, clang-format, clang-tidy, gdb, `libfcgi-dev`,
@@ -138,7 +145,7 @@ unit tests, because their logic only exists in a running system:
 
 | File | how it is covered |
 |---|---|
-| `src/fcgi/fcgi_server.cpp` | `tests/unit/test_fcgi_server_run.cpp` drives the real FastCGI record protocol over a Unix socket (a child runs `run()`, the test speaks BEGIN_REQUEST/PARAMS/STDIN and reads STDOUT/END_REQUEST); `tests/e2e/test_spawn_mode_e2e.cpp` covers the spawn-fcgi mode of the built binary. |
+| `src/fcgi/fcgi_server.cpp` | `tests/unit/test_fcgi_server_run.cpp` drives the real FastCGI record protocol over a Unix socket (a child runs `run()`, the test speaks BEGIN_REQUEST/PARAMS/STDIN and reads STDOUT/END_REQUEST); `tests/e2e/test_main_e2e.cpp` and the black-box suites drive the built binary through its listen socket. |
 | `src/main.cpp` | `tests/e2e/test_main_e2e.cpp` starts the built binary: command line (`-v`/`-h`/`--discover`), configuration validation, and the fork-based supervisor — it kills a worker and the cache reader to force restarts, kills a worker holding long-poll tokens, and shuts the pool down with SIGTERM. |
 
 Coverage builds install a SIGTERM handler in the worker/cache-reader children

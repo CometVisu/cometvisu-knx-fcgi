@@ -32,9 +32,9 @@
  *   - Uses a shared-memory cache with process-shared mutex/condvar
  *     instead of per-process caches or knxd's built-in cache.
  *   - For t=0 (read from bus): enqueues GroupValueRead telegrams for uncached
- *     addresses into the shared TX ring, then returns immediately.
- *     Read-responses arrive asynchronously and are handled like normal bus
- *     writes by the cache reader process.
+ *     addresses into the shared TX ring and polls for at most about a second
+ *     for the answers.  A response that arrives later is delivered by the next
+ *     read; the cache reader handles it like any other bus telegram.
  */
 
 #pragma once
