@@ -172,7 +172,7 @@ TEST_F(RealKnxdE2ETest, LoginAnonymous) {
   Router router(knxd_, cache_, sessions_);
   auto resp = router.route(req("POST", "/l"));
   EXPECT_EQ(resp.status_code, 200);
-  EXPECT_NE(resp.body.find("\"v\":\"0.0.2\""), std::string::npos);
+  EXPECT_NE(resp.body.find("\"v\":\"0.0.3\""), std::string::npos);
   EXPECT_NE(resp.body.find("\"s\":\"0\""), std::string::npos);
 }
 

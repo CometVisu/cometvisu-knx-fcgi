@@ -70,7 +70,7 @@ and ignored.
 
 ### Sessions
 
-* `/l` returns `{"v":"0.0.2","s":"<id>"}`.  Without `u` and `p` the id is the
+* `/l` returns `{"v":"0.0.3","s":"<id>"}`.  Without `u` and `p` the id is the
   anonymous session `"0"`.  A normal build also adds a `"c"` object with
   `fcgiVersion`, `fcgiGitHash` and — when configured — `baseURL`,
   `knxdBuildVersion`, `knxdBuildGitHash` and the raw members of

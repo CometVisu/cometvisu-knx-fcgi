@@ -46,7 +46,7 @@ TEST_F(FullFlowTest, AnonymousLogin) {
   LoginHandler handler(sessions_);
 
   std::string response = handler.handle("s=0&");
-  EXPECT_NE(response.find("\"v\":\"0.0.2\""), std::string::npos);
+  EXPECT_NE(response.find("\"v\":\"0.0.3\""), std::string::npos);
   EXPECT_NE(response.find("\"s\":\"0\""), std::string::npos);
 }
 
@@ -54,7 +54,7 @@ TEST_F(FullFlowTest, AuthenticatedLogin) {
   LoginHandler handler(sessions_);
 
   std::string response = handler.handle("s=0&u=admin&p=secret&d=mydevice");
-  EXPECT_NE(response.find("\"v\":\"0.0.2\""), std::string::npos);
+  EXPECT_NE(response.find("\"v\":\"0.0.3\""), std::string::npos);
 
   // Session ID should NOT be "0"
   EXPECT_EQ(response.find("\"s\":\"0\""), std::string::npos);
@@ -90,7 +90,7 @@ TEST_F(FullFlowTest, RouterLoginRoute) {
 
   auto resp = router.route(req);
   EXPECT_EQ(resp.status_code, 200);
-  EXPECT_NE(resp.body.find("\"v\":\"0.0.2\""), std::string::npos);
+  EXPECT_NE(resp.body.find("\"v\":\"0.0.3\""), std::string::npos);
 }
 
 TEST_F(FullFlowTest, RouterReadRoute) {
@@ -145,7 +145,7 @@ TEST_F(FullFlowTest, LoginResponseStructure) {
   // Should be valid JSON object with v and s keys
   EXPECT_EQ(response.front(), '{');
   EXPECT_EQ(response.back(), '}');
-  EXPECT_NE(response.find("\"v\":\"0.0.2\""), std::string::npos);
+  EXPECT_NE(response.find("\"v\":\"0.0.3\""), std::string::npos);
   EXPECT_NE(response.find("\"s\":"), std::string::npos);
 }
 

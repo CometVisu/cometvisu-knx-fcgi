@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Protocol version 0.0.3**: `/l` now reports `0.0.3`, and the CometVisu
+  wiki pages `Protocol`/`Protokoll` document the rules this backend always
+  implemented (mandatory session id, numeric index, a long-poll that may end
+  with an empty answer, the KNX write APDU encoding, the optional bus state
+  object, `400`/`503`).  Existing clients are unaffected: they send `s` with
+  every request and accept the version.
+
 - **`SESSION_TTL_SEC` / `SESSION_MAX`** (default `1800` / `10000`): session
   lifetime and the number of concurrent sessions.  A *session* lives for
   minutes — it is deliberately independent of the request wait limit.

@@ -80,7 +80,7 @@ public:
 
   /// @brief Process a login request.
   /// @param query_string Raw QUERY_STRING from FCGI (e.g. "u=admin&p=secret&d=web").
-  /// @return JSON response body: `{"v":"0.0.2","s":"SESSION_ID"}` with optional
+  /// @return JSON response body: `{"v":"0.0.3","s":"SESSION_ID"}` with optional
   ///         `"c":{...}` configuration block.
   [[nodiscard]] std::string handle(std::string_view query_string);
 
