@@ -223,21 +223,39 @@ int connect_unix(const std::string& path, int receive_timeout_sec) {
   return fd;
 }
 
+/// One FastCGI record.  libfcgi concatenates records of the same type, so a
+/// content block larger than the 16-bit length field is split.
 std::string fcgi_record(std::uint8_t type, const std::string& content) {
-  std::string out{'\x01',
-                  static_cast<char>(type),
-                  '\x00',
-                  '\x01',
-                  static_cast<char>((content.size() >> 8) & 0xFF),
-                  static_cast<char>(content.size() & 0xFF),
-                  '\x00',
-                  '\x00'};
-  return out + content;
+  constexpr std::size_t kMaxRecordBytes = 0xFFFF;
+  std::string out;
+  std::size_t offset = 0;
+  do {
+    const std::size_t chunk = std::min(kMaxRecordBytes, content.size() - offset);
+    out.append({'\x01', static_cast<char>(type), '\x00', '\x01',
+                static_cast<char>((chunk >> 8) & 0xFF), static_cast<char>(chunk & 0xFF), '\x00',
+                '\x00'});
+    out.append(content, offset, chunk);
+    offset += chunk;
+  } while (offset < content.size());
+  return out;
+}
+
+/// FastCGI name/value length: one octet below 128, otherwise four octets with
+/// the high bit of the first one set (FCGI spec, section 3.3).  A single-octet
+/// encoding of a longer value produces a malformed PARAMS record, and the
+/// backend then answers nothing at all — which is easy to mistake for a server
+/// bug (a query string grows past 127 bytes with ~12 addresses).
+std::string fcgi_length(std::size_t length) {
+  if (length < 128) {
+    return std::string{static_cast<char>(length)};
+  }
+  return std::string{static_cast<char>(0x80 | ((length >> 24) & 0x7F)),
+                     static_cast<char>((length >> 16) & 0xFF),
+                     static_cast<char>((length >> 8) & 0xFF), static_cast<char>(length & 0xFF)};
 }
 
 std::string fcgi_param(const std::string& name, const std::string& value) {
-  return std::string{static_cast<char>(name.size()), static_cast<char>(value.size())} + name +
-         value;
+  return fcgi_length(name.size()) + fcgi_length(value.size()) + name + value;
 }
 
 }  // namespace

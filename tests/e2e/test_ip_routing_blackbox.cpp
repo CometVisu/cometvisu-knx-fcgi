@@ -575,6 +575,70 @@ TEST_F(IpRoutingBlackBox, GroupValueReadRequestsArePublished) {
   EXPECT_EQ(apdu, (Bytes{0x00, 0x00})) << "A_GroupValue_Read";
 }
 
+TEST_F(IpRoutingBlackBox, TZeroOnAWarmCacheDoesNotAskTheBusAgain) {
+  // A page load subscribes several addresses at once; every one of them must be
+  // requested once, and a reload (a second `t=0` over the same list) must ask
+  // the bus for none of them once the answers are in the cache.  Twelve
+  // addresses also push the query string past the 127-byte FastCGI parameter
+  // boundary (see fcgi_length() in the harness).
+  constexpr int kCount = 12;
+  std::string target;
+  for (int i = 0; i < kCount; ++i) {
+    target += (target.empty() ? "" : "&") + std::string("a=") + group_text(100 + i);
+  }
+  target += "&t=0";
+
+  monitor_->drain();
+
+  // First page load: the addresses are unknown → one GroupValueRead each.
+  const auto first = read(target);
+  ASSERT_EQ(first.status, 200) << first.body << "\n" << backend_->log();
+  ASSERT_EQ(backend_frames(0, 4000, kCount).size(), static_cast<std::size_t>(kCount))
+      << backend_->log();
+
+  // Every device answers on the bus.
+  for (int i = 0; i < kCount; ++i) {
+    const Bytes response_apdu{0x00, 0x40, 0x42};  // A_GroupValue_Response, value 0x42
+    ASSERT_TRUE(monitor_->inject(
+        cvknx::blackbox::cemi_group_indication(0x1102, group_value(100 + i), response_apdu)));
+  }
+  std::string expected = "{";
+  for (int i = 0; i < kCount; ++i) {
+    expected += (i == 0 ? "" : ",") + std::string("\"1/2/") + std::to_string(100 + i) + "\":\"42\"";
+  }
+  expected += "}";
+  ASSERT_EQ(cvknx::blackbox::response_data_object(wait_for_data(target, expected, 4000)), expected)
+      << backend_->log();
+
+  // Reload of the client: every value is cached, so the bus stays quiet.
+  monitor_->drain();
+  const auto second = read(target);
+  EXPECT_EQ(cvknx::blackbox::response_data_object(second), expected) << second.body;
+  EXPECT_TRUE(backend_frames(0, 800).empty()) << "a warm cache must not be re-read from the bus\n"
+                                              << backend_->log();
+}
+
+TEST_F(IpRoutingBlackBox, TZeroAsksAgainForAddressesTheBusNeverAnswered) {
+  // A device without the "read" flag answers nothing, so its value never enters
+  // the cache.  `t=0` means "read from the bus" (protocol), so every page load
+  // asks again — that is intended, and a permanently silent answer must not be
+  // remembered as if it were a value.
+  const std::string target = "a=" + group_text(130) + "&t=0";
+  monitor_->drain();
+
+  ASSERT_EQ(read(target).status, 200);
+  ASSERT_EQ(backend_frames(group_value(130), 1500, 1).size(), 1U) << backend_->log();
+
+  // Nothing answered: the second `t=0` (a reload) has to ask again.
+  monitor_->drain();
+  const auto second = read(target);
+  EXPECT_EQ(second.status, 200);
+  EXPECT_EQ(cvknx::blackbox::response_data_object(second), "{}") << second.body;
+  EXPECT_EQ(backend_frames(group_value(130), 1500, 1).size(), 1U)
+      << "an unanswered address must be requested again on the next t=0\n"
+      << backend_->log();
+}
+
 // ===========================================================================
 // Own echo / multi client semantics (AGENTS.md rule 1)
 // ===========================================================================

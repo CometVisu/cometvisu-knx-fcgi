@@ -777,6 +777,22 @@ Rules for these tests:
   command line in that order;
 - give the backend several workers (`FCGI_WORKERS=4`): a blocked long-poll must
   not be able to starve `/w`.
+- the FastCGI client must encode name/value lengths the way the protocol says
+  (one octet below 128, otherwise four with the high bit of the first set).  A
+  single-octet length made every request with a query string of 128 bytes or
+  more a malformed `PARAMS` record: the backend answered *nothing* (HTTP status
+  0 in the harness), which looks exactly like a server that dies on a longer
+  address list — the first test with 12 addresses hit it.  It is also why
+  "a warm cache is not re-read" (and any other long address list) could not be
+  covered before.
+
+**`t=0` semantics, as the black-box suites pin them:** a `t=0` read sends one
+`A_GroupValue_Read` per address that is *not* in the cache and none for an
+address that is.  A reload of the client therefore asks the bus again only for
+the addresses whose answer never arrived (a device without the read flag, or one
+that is slow).  That is intended ("read from the bus"), not a cache bug — the
+tests `TZeroOnAWarmCacheDoesNotAskTheBusAgain` and
+`TZeroAsksAgainForAddressesTheBusNeverAnswered` fix both halves of the rule.
 
 ## Reference: Existing CometVisu Backend Implementations
 
